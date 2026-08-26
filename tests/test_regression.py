@@ -35,6 +35,7 @@ DET = _load("A_선검출")
 EQ7 = _load("eq7_laser_plane")
 REPORT = _load("report")
 RP = _load("run_pipeline")
+EQ8 = _load("eq8_silhouette")
 # synth_scene 은 자기 인스턴스의 calibration 을 본다. _load 는 호출마다
 # 새 모듈을 만들므로, 위의 CALIB 에 use_profile 을 걸어도 합성 씬은 옛
 # 프로파일로 남는다. 씬을 만드는 검증은 이쪽을 써야 한다.
@@ -818,6 +819,58 @@ def test_single_line_member():
           and abs(r3["theta_deg"] - 0.3) < 0.5)
 
 
+def test_silhouette_recovery():
+    """[15] 가림 그림자로 한 줄짜리 부재의 옆 기울기를 되찾는다"""
+    print("\n[15] eq8 실루엣 — 한 줄짜리 부재 되살리기")
+    f, b, cx, cy = 826.0, 0.15, 634.5, 531.5
+    g = np.array([0.0, 1.0, 0.0])
+    Z = 1.70
+    rng = np.random.default_rng(9)
+
+    w = EQ8.shadow_width_px(Z, 2.70, f, b)
+    check(f"그림자 폭 예측 {w:.1f}px = f·b·(1/Z−1/Zb)",
+          abs(w - f * b * (1 / Z - 1 / 2.70)) < 1e-9)
+    check("배경이 부재보다 앞이면 그림자 없음",
+          EQ8.shadow_width_px(Z, 1.2, f, b) is None)
+
+    for tilt in (0.0, 0.5, 1.5):
+        v = np.linspace(50, 1000, 21)
+        Y = (v - cy) * Z / f
+        X0 = 0.20 + np.tan(np.radians(tilt)) * (Y - Y.mean())
+        u = (X0 - b) * f / Z + cx + rng.normal(0, 2.0, len(v))
+        r = EQ8.axis_from_edges(np.column_stack([v, u]), Z, f, cx, cy, b, g)
+        check(f"옆 기울기 {tilt}° → 복원 {r['theta_deg']:.4f}° "
+              f"(잔차 {r['rms_px']:.2f}px)",
+              r["ok"] and abs(r["theta_deg"] - tilt) < 0.3)
+
+    # 가짜 가장자리를 지어내지 않는가 — 이것이 없으면 없는 기울기를 만든다
+    v = np.linspace(50, 1000, 21)
+    u = (0.20 - b) * f / Z + cx + rng.normal(0, 1.0, len(v))
+    u[[3, 9, 15]] += 40.0
+    r = EQ8.axis_from_edges(np.column_stack([v, u]), Z, f, cx, cy, b, g)
+    check(f"몇 행만 튀면 버리고 이어간다 (버린 점 {r.get('n_dropped')}개, "
+          f"{r['theta_deg']:.4f}°)",
+          r["ok"] and r.get("n_dropped", 0) >= 3 and abs(r["theta_deg"]) < 0.3)
+    u2 = (0.20 - b) * f / Z + cx + rng.normal(0, 8.0, len(v))
+    r2 = EQ8.axis_from_edges(np.column_stack([v, u2]), Z, f, cx, cy, b, g)
+    check("가장자리가 통째로 어지러우면 되살리지 않는다 "
+          f"(잔차 {r2['rms_px']:.2f}px)", not r2["ok"])
+
+    # 그림자에서 가장자리를 실제로 뽑는가 — 합성 행으로
+    W, H = 1269, 1063
+    sig = np.zeros((H, W), np.float32)
+    edge_true = 400
+    gap = int(round(EQ8.shadow_width_px(Z, 2.70, f, b)))
+    rows = list(range(100, 1000, 45))
+    for vv in rows:
+        sig[vv, :edge_true + 1] = 255.0
+        sig[vv, edge_true + 1 + gap:] = 255.0
+    got = EQ8.find_shadow_edges(sig, rows, edge_true - 20, Z, 2.70, f, b)
+    check(f"합성 그림자에서 가장자리 {got['n_found']}/{got['n_checked']}행 검출",
+          got["n_found"] == len(rows)
+          and all(abs(e[1] - edge_true) <= 1 for e in got["edges"]))
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -828,7 +881,8 @@ def main():
               test_segmentation_robustness, test_boundary_rejection,
               test_eq7_laser_plane, test_h_lines_in_pipeline,
               test_pointcloud_export, test_rolled_grid_detection,
-              test_run_pipeline_inputs, test_single_line_member):
+              test_run_pipeline_inputs, test_single_line_member,
+              test_silhouette_recovery):
         t()
     print("\n" + "=" * 70)
     if _FAILS:

@@ -43,6 +43,7 @@ _EQ4 = _load("eq4_flatness_line")
 _EQ5 = _load("eq5_region_assign")
 _EQ6 = _load("eq6_straightedge")
 _EQ7 = _load("eq7_laser_plane")
+_EQ8 = _load("eq8_silhouette")
 _SEG = _load("C_영역분할")
 
 # 평활도 허용 기준 (PDF 1.2 표: 노출 콘크리트 3m당 7mm, 미장 1m당 10mm 등).
@@ -114,6 +115,71 @@ def _defects_in_image(fd, camera_params):
         })
     out.sort(key=lambda d: -abs(d["depth_mm"]))
     return out
+
+
+def resolve_single_plane_members(result, rgb, camera_params, g_hat,
+                                 to_image=None):
+    """
+    격자선 한 줄만 걸려 판정보류로 막힌 부재를, 가림 그림자로 되살린다.
+
+    세로선 한 줄은 레이저 평면 **안**의 기울기만 준다. 가로선은 그 부재를
+    21번 가로지르지만 깊이를 못 준다 — 그런데 부재가 뒤 배경에 드리우는
+    **그림자**의 시작점이 곧 부재의 실루엣 가장자리이고, 부재 깊이는 이미
+    세로선에서 알고 있다. 그래서 가장자리를 그 깊이에 놓으면 평면에
+    수직인 성분까지 나온다 (eq8).
+
+    두 성분은 서로 직교한다 — 세로선은 레이저 평면 안, 실루엣은 그 평면에
+    수직인 방향(등깊이면)에서 잰다. 작은 각도에서는 제곱합으로 합친다.
+
+        θ_total ≈ √(θ_평면안² + θ_평면수직²)
+
+    되살아나지 않으면(뒤에 배경이 없거나 그림자 폭이 예측과 안 맞으면)
+    판정보류를 **그대로 둔다**. 조용히 합격으로 바꾸지 않는다.
+
+    camera_params 와 to_image 는 **이미지 화소 기준** 이어야 한다. 검측
+    좌표는 센서 기준이고 캡처가 180° 돌아 있기도 해서, 그대로 넣으면
+    엉뚱한 자리를 훑는다. to_image 가 그 변환을 맡는다.
+    """
+    if rgb is None:
+        return 0
+    regs = result.get("regions") or []
+    targets = [r for r in regs
+               if r.get("single_plane") and r.get("kind") == "axis_vertical"
+               and r.get("status") == "measured"]
+    if not targets:
+        return 0
+    sig = _EQ8.laser_signal(rgb)
+    n_ok = 0
+    for r in targets:
+        try:
+            res = _EQ8.resolve_member(sig, r, regs, camera_params, g_hat,
+                                      to_image=to_image)
+        except Exception as e:
+            res = {"ok": False, "reason": f"실패: {e}"}
+        r["silhouette"] = res
+        if not res.get("ok"):
+            continue
+        th_plane = float(r.get("theta_deg") or 0.0)
+        th_edge = float(res["theta_deg"])
+        th = float(np.hypot(th_plane, th_edge))
+        r["theta_deg_plane_only"] = round(th_plane, 4)
+        r["theta_deg_lateral"] = round(th_edge, 4)
+        r["theta_deg"] = round(th, 4)
+        r["single_plane"] = False
+        kcs = _EQ5.KCS_CLASS.get(r["class"], r["class"])
+        j = _EQ3.judge_kcs(th, kcs, member_length_m=None)
+        j["resolved_by"] = "가림 그림자 실루엣 (eq8)"
+        j["note"] = (
+            f"세로선 한 줄로는 레이저 평면 안 성분({th_plane:.4f}°)밖에 못 "
+            f"쟀다. 부재가 배경에 드리운 그림자에서 실루엣 가장자리를 "
+            f"{res['n_points']}개 높이에서 찾아(예측 폭 "
+            f"{res['shadow']['expected_width_px']}px) 평면에 수직인 성분 "
+            f"{th_edge:.4f}° 를 되찾았고, 둘을 제곱합으로 합쳐 {th:.4f}° 다. "
+            f"가장자리 직선 잔차 {res['rms_px']}px, 세로 구간 "
+            f"{res['span_m']}m.")
+        r["judge"] = j
+        n_ok += 1
+    return n_ok
 
 
 def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):

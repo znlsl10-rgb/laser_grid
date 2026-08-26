@@ -531,6 +531,25 @@ def _run_full(image, params, truth, scene_image, imu, out, out_dir, name,
     res["triangulation"] = tri
     res["pixel_source"] = "detected"
     res["depth_check"] = depth
+
+    # 한 줄만 걸린 부재를 가림 그림자로 되살린다. 검측 좌표는 센서 기준·
+    # 표준 규약이고 이미지는 화면 기준·원본 규약이라 변환을 넘긴다.
+    su = det_eval["scale_to_sensor"]; sv = det_eval["scale_to_sensor_v"]
+    flip = bool(cap["diag"]["uv 180° 뒤집힘"])
+    cxs, cys = cp["cx_px"], cp["cy_px"]
+
+    def _to_img(a):
+        a = np.asarray(a, float)
+        if flip:
+            a = np.stack([2 * cxs - a[..., 0], 2 * cys - a[..., 1]], axis=-1)
+        return a / np.array([su, sv])
+
+    cp_img = {"f_px": cp["f_px"] / su, "b_m": cap.get("b_raw", cp["b_m"]),
+              "cx_px": cxs / su, "cy_px": cys / sv}
+    n_res = PIPE.resolve_single_plane_members(res, rgb, cp_img, g_hat,
+                                              to_image=_to_img)
+    if n_res:
+        say(f"    가림 그림자로 {n_res}개 부재의 옆 기울기 복원")
     say(); say(PIPE.format_report(res))
 
     # 배경은 원본 규약, 검측 좌표는 표준 규약이다. 배경을 돌리는 대신

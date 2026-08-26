@@ -1161,6 +1161,36 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
     res["triangulation"] = tri_info
     res["pixel_source"] = src
     res["depth_check"] = depth
+
+    # 격자선 한 줄만 걸린 부재를 가림 그림자로 되살린다 (eq8).
+    # 검측 좌표는 센서 기준·표준 규약, 이미지는 화면 기준·원본 규약이다.
+    if det_eval and not det_eval.get("error"):
+        try:
+            from PIL import Image as _PIL
+            _im = np.asarray(_PIL.open(os.path.join(path, det_eval["image"]))
+                             .convert("RGB"))
+            _su = det_eval["scale_to_sensor"]
+            _sv = det_eval["scale_to_sensor_v"]
+            _fl = bool(cap["diag"]["uv 180° 뒤집힘"])
+            _cx, _cy = cp["cx_px"], cp["cy_px"]
+
+            def _to_img(a, _cx=_cx, _cy=_cy, _fl=_fl, _su=_su, _sv=_sv):
+                a = np.asarray(a, float)
+                if _fl:
+                    a = np.stack([2 * _cx - a[..., 0], 2 * _cy - a[..., 1]],
+                                 axis=-1)
+                return a / np.array([_su, _sv])
+
+            _cpi = {"f_px": cp["f_px"] / _su,
+                    "b_m": cap.get("b_raw", cp["b_m"]),
+                    "cx_px": _cx / _su, "cy_px": _cy / _sv}
+            _n = PIPE.resolve_single_plane_members(res, _im, _cpi,
+                                                   cap["g_hat"],
+                                                   to_image=_to_img)
+            if _n:
+                print(f"    가림 그림자로 {_n}개 부재의 옆 기울기 복원")
+        except Exception as e:
+            print(f"    [경고] 실루엣 복원 실패: {e}")
     print()
     print(PIPE.format_report(res))
 
