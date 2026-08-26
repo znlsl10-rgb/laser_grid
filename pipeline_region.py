@@ -36,7 +36,6 @@ def _load(name):
     return m
 
 
-_EQ1 = _load("eq1_triangulation")
 _EQ2 = _load("eq2_plane_fit")
 _EQ3 = _load("eq3_orientation")
 _EQ4 = _load("eq4_flatness_line")

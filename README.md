@@ -15,8 +15,8 @@
 1 shot = (rgb_off, rgb_on, IMU ĝ, calib)
  ├─[A ] 선검출        rgb_on  → {lid: [(u,v)…]}      A_선검출.py
  ├─[C ] 영역분할      rgb_off → label_map            C_영역분할.py
- ├─[eq7] 레이저 평면           → 선별 법선 n·깊이 이득 g  eq7_laser_plane.py
- ├─[eq1] 삼각측량             → (X,Y,Z) 조사기 좌표계  eq1_triangulation.py
+ ├─[eq7] 레이저 평면·삼각측량   → 선별 법선 n·이득 g·(X,Y,Z)  eq7_laser_plane.py
+ │        (eq1 은 이 식의 특수해 — roll=0·tilt=0·V선. 규격 원식이자 회귀 기준)
  ├─[eq5] 영역 할당            → 침식·불연속 제거, 융합  eq5_region_assign.py
  └─ 영역별 검측                                       pipeline_region.py
      벽·거푸집·조적  → eq2 평면(TLS) → eq3 수직도(중력) + eq4·eq6 평활도
@@ -170,14 +170,14 @@ python3 experiment.py                            # 기선 x 거리 sweep
 | `inspection.py` | Isaac 촬영 → 선검출 → 시맨틱 마스크 → 영역별 검측 |
 | `A_선검출.py` | 20×20 격자 선검출 (v9). `multi_surface=True` 로 단일 평면 가정 해제 |
 | `C_영역분할.py` | 영역 분할. `gt`(Isaac Semantics) / `geom`(다중평면 RANSAC) / `sam`·`vlm`(미구현) |
-| `eq1_triangulation.py` | 능동 삼각측량 |
+| `eq1_triangulation.py` | 능동 삼각측량 — 규격 원식 `Z=f·b/(f·tanα−(u−c_x))`. **파이프라인은 이 파일을 호출하지 않는다**: V선·roll 0 에서만 성립하고 β(가로선 각)를 받아 놓고 쓰지 않는다. eq7 의 정답 기준(회귀 [2])으로 남긴다 |
 | `eq2_plane_fit.py` | TLS 평면적합, PCA·RANSAC 축적합, 면내 좌표계 |
 | `eq3_orientation.py` | **중력 기준** 수직도·수평도·부재 수직도, KCS 판정 |
 | `eq4_flatness_line.py` | 요철 위치·깊이 (면내 격자) |
 | `eq5_region_assign.py` | 점→영역 할당, 경계 정제, 의미×기하 융합, 불확실도 |
 | `eq6_straightedge.py` | **KCS 직선자 평활도 판정** + 분해능 편향 진단 |
-| `eq7_laser_plane.py` | **레이저 평면 일반화** — V·H 를 한 식으로, 깊이 이득 g |
-| `eq8_silhouette.py` | **가림 그림자 실루엣** — 한 줄짜리 부재의 옆 기울기 복원 |
+| `eq7_laser_plane.py` | **레이저 평면 일반화 + 실제 삼각측량 경로** — 평면 법선 n 하나로 V·H·굴린 격자를 한 식에. 깊이 이득 `g=√(n_x²+n_y²)/\|n_x\|` 가 '이 선이 깊이를 줄 수 있는가' 를 가른다(roll 0 의 가로선은 g=∞ → 배제) |
+| `eq8_silhouette.py` | **옆(레이저 평면 수직) 기울기 복원** — 세로선 한 줄이 원리적으로 못 보는 성분을 부재 그림자에서 되찾는다. 단서 두 가지: ① 검출된 **가로선 화소의 끊김**(`axis_from_line_gaps`, 부재 지름·중심도 함께 나온다) ② 원신호 그림자 스캔(`resolve_member`, ①이 실패할 때). 실측 3본 중 ①이 1본, ②가 2본을 살렸다 |
 | `calibration.py` | 사양 프로파일 단일 출처 (legacy / pdf / improved / diagonal) |
 | `load_capture.py` | Isaac raycast 내보내기 폴더 → 검측 + 선검출 정확도 대조 |
 | `inspect_png.py` | 단일 이미지 검측 + 격자·사양 교차확인 |

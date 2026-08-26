@@ -44,7 +44,6 @@ def _load(name):
     return m
 
 
-_EQ1 = _load("eq1_triangulation")
 _EQ7 = _load("eq7_laser_plane")
 
 # ── 정답값 (Isaac 씬의 HORIZ=0.3, VBACK=0.5 규약을 그대로 따름) ──
