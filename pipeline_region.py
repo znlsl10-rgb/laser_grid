@@ -1329,9 +1329,20 @@ def format_report(result):
                 else "N/A")
         fjud = f.get("judgement", "N/A") if f.get("applicable") else "N/A"
         sn = r["uncertainty"]["sigma_normal_mm"]
+        # 표에는 짧은 표기만 넣는다 — "판정보류(단면 미분해)" 를 그대로
+        # 넣으면 칸을 넘겨 각도와 붙어 버린다. 괄호 안 사유는 아래 줄에.
+        short, _, why = verdict.partition("(")
         lines.append(f"  {r['class']:<14}{kind_ko.get(r['kind'], r['kind']):<10}"
-                     f"{r['theta_deg']:>9.4f}{verdict:>10}"
+                     f"{r['theta_deg']:>9.4f}{short:>10}"
                      f"{fmax:>12}{fjud:>10}{sn:>9.2f}{r['n_points']:>7}")
+        if why:
+            lines.append(f"      ↳ 사유: {why.rstrip(')')}"
+                         + (f" / {j['resolved_by']}"
+                            if j.get("resolved_by") else ""))
+        elif j.get("resolved_by"):
+            lines.append(f"      ↳ 옆 성분 복원: {j['resolved_by']} "
+                         f"(평면안 {j.get('theta_deg_plane_only')}° + "
+                         f"평면수직 {j.get('theta_deg_lateral')}°)")
         if r["label_fusion"]["source"] == "geometric":
             lines.append(f"      ↳ 라벨 교정: {r['label_fusion_note']}")
         if f.get("judgement") == "측정불가":

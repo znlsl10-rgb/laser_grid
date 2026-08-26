@@ -437,8 +437,17 @@ def run(image, params=None, imu=None, truth=None, scene_image=None,
     rgb = read_image(image)
     H, W = rgb.shape[:2]
     name = _os.path.splitext(_os.path.basename(image))[0]
-    out = out or _os.path.join(_os.path.dirname(_os.path.abspath(image)) or ".",
-                               f"{name}_품질검측조서.xlsx")
+    # out 은 조서 **파일** 경로다. 그런데 코랩에서는 폴더를 주기 쉽고,
+    # 그러면 확장자 없는 파일이 하나 생겨 openpyxl 도 pandas 도 다시 못
+    # 연다(엑셀도 못 연다). 조용히 그런 파일을 남기지 말고 바로잡는다.
+    fname = f"{name}_품질검측조서.xlsx"
+    if not out:
+        out = _os.path.join(_os.path.dirname(_os.path.abspath(image)) or ".",
+                            fname)
+    elif _os.path.isdir(out) or out.endswith(("/", _os.sep)):
+        out = _os.path.join(out, fname)
+    elif _os.path.splitext(out)[1].lower() not in (".xlsx", ".xlsm"):
+        out = out + ".xlsx"
     out_dir = _os.path.dirname(_os.path.abspath(out)) or "."
     _os.makedirs(out_dir, exist_ok=True)
 
