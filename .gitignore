@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 산출물
+_report_demo/
+_검측결과/
+*.xlsx
+!docs/*.xlsx
+out/
+
+# Isaac Sim 출력
+inspection_output/
+*.usd
+*.usda
