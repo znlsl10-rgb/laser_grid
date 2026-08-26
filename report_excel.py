@@ -495,6 +495,32 @@ def _sheet_depth(wb, openpyxl, depth, det=None, source=None):
         ws.append([a, b, c])
     _style(ws, openpyxl, widths=[24, 30, 78])
 
+    fc = depth.get("개선예측_mm")
+    if fc:
+        ws.append([])
+        h = ws.max_row + 1
+        ws.append(["이 오차를 줄이는 방법", "예상 깊이 산포", "설명"])
+        ws.append(["현재 입력", f"{fc['현재']:.2f} mm",
+                   "지금 넣은 이미지에서 실제로 나온 값"])
+        if "원해상도로 저장" in fc:
+            ws.append([f"원해상도로 저장 (×{fc['해상도 배율']})",
+                       f"{fc['원해상도로 저장']:.2f} mm",
+                       "화면 캡처를 줄여서 저장하면 그 배율만큼 서브픽셀 "
+                       "정밀도를 버린다. 센서 해상도 그대로 저장하기만 해도 "
+                       "이만큼 좋아진다 — 촬영 설정이지 알고리즘이 아니다"])
+        if "+ 안티에일리어싱" in fc:
+            ws.append(["+ 안티에일리어싱", f"{fc['+ 안티에일리어싱']:.2f} mm",
+                       "선 가장자리에 밝기 기울기가 생겨 중심을 화소 사이에서 "
+                       "읽을 수 있다. 이진(0/255)으로 그려진 지금은 그 정보가 "
+                       "아예 없다"])
+        ws.append(["", "", ""])
+        ws.append(["하드웨어 쪽 지렛대", "",
+                   "σ_Z = σ_u·Z²/(f·b) 이므로 기선 b 를 늘리거나, 초점거리 "
+                   "f 를 늘리거나, 측정거리 Z 를 줄이면 함께 좋아진다. "
+                   "Z 는 제곱으로 들어가 가장 세다 — 2.7m 에서 1.5m 로 "
+                   "다가서면 오차가 1/3 이 된다"])
+        _style(ws, openpyxl, widths=[24, 30, 78], header_row=h)
+
     pl = depth.get("per_line_mm") or {}
     if pl:
         ws.append([])
@@ -690,12 +716,13 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
     """
     ws = wb.create_sheet("9.3D좌표(부재별)")
     rows = REPORT.region_xyz_summary(result, g_hat=g_hat)
-    ws.append(["부재", "클래스", "검측", "상태", "점 수", "선 구성",
-               "깊이이득", "중심 X(m)", "중심 Y(m)", "중심 Z(m)",
+    ws.append(["부재", "클래스", "검측", "상태", "측정 점수", "가로선 점수",
+               "선 구성", "깊이이득", "중심 X(m)", "중심 Y(m)", "중심 Z(m)",
                "거리범위(m)", "가로폭(m)", "깊이폭(m)", "높이폭(m)"])
     for r in rows:
         ws.append([
             r["부재번호"], r["클래스"], r["검측"], r["상태"], r["점수"],
+            r.get("가로선점수", 0),
             r.get("선구성"), r.get("깊이이득_RMS"),
             r["중심_X_m"], r["중심_Y_m"], r["중심_Z_m"],
             f"{r['거리범위_m'][0]} ~ {r['거리범위_m'][1]}",
@@ -703,7 +730,7 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
     if not rows:
         ws.append(["3D 점이 없다 — 삼각측량 단계를 확인할 것"])
     _style(ws, openpyxl,
-           widths=[7, 14, 14, 10, 10, 20, 10, 12, 12, 12, 18, 12, 12, 12])
+           widths=[7, 14, 14, 10, 11, 12, 20, 10, 12, 12, 12, 18, 12, 12, 12])
 
     n = ws.max_row + 2
     ws.cell(row=n, column=1, value="좌표계 설명").font = \
@@ -717,10 +744,14 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
         "장비 설치 높이를 더해야 한다 — 그 값은 이 장비가 알 수 없다.",
         "선 구성은 그 부재의 점이 V선(세로)·H선(가로) 중 어디서 왔는지다. "
         "가로선이 깊이를 못 주는 사양에서는 V 만 나온다.",
+        "가로선 점수는 깊이를 못 주는 선의 화소를 이미 맞춘 면 위에 올려 "
+        "위치만 표시한 것이다. 화소 위치는 실제 검출값이지만 거리는 면에서 "
+        "빌려 온 유도값이라, 그 면에 대한 잔차가 정의상 0 이다. 그래서 "
+        "수직도·수평도·평활도 계산에는 넣지 않았다.",
     ]):
         ws.cell(row=n + 1 + i, column=1, value=t)
         ws.merge_cells(start_row=n + 1 + i, start_column=1,
-                       end_row=n + 1 + i, end_column=14)
+                       end_row=n + 1 + i, end_column=15)
     _embed_image(ws, image_path, n + 6, max_px=1700, openpyxl=openpyxl,
                  caption="[그림] 부재별 3D 점군 — 등각·평면도·정면도·측면도. "
                          "중력 정렬 좌표라 벽은 서고 바닥은 눕는다")

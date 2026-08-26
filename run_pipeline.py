@@ -223,9 +223,57 @@ def quantization_floor(rgb):
                        "선 중심이 0.5px 격자에 갇혀 σ 0.289px 아래로는 "
                        "원리적으로 못 내려간다. 렌더에 AA 를 켜거나 "
                        "실촬영본을 쓰면 개선된다.")
+        # 선폭도 같이 잰다 — 폭이 굵을수록 켜진 화소가 많아 중심이
+        # 안정되지만, 이진에서는 폭이 커져도 격자 간격은 그대로다.
+        row = g[g.shape[0] // 2]
+        on = row > mx * 0.5
+        d = np.diff(on.astype(int))
+        st, en = np.where(d == 1)[0], np.where(d == -1)[0]
+        n = min(len(st), len(en))
+        if n:
+            out["line_width_px"] = float(np.median(en[:n] - st[:n]))
     else:
         out["note"] = "밝기 기울기가 있다 — 서브픽셀 정보가 살아 있다."
     return out
+
+
+def improvement_forecast(sigma_u_img_px, cp, z_m, sensor_w=None, binary=True):
+    """
+    "이 오차를 어떻게 줄이나" 에 대한 **숫자로 된 답**.
+
+    깊이 잡음은 σ_Z = σ_u · Z²/(f·b) 다. σ_u 는 센서 화소 단위여야 하므로,
+    화면을 축소해 저장했으면 그 배율만큼 손해를 본다. 통제 실험(합성 격자,
+    같은 장면·같은 추정기)에서 잰 값:
+
+        1269×1063 이진   σ_u 0.577 센서px → 5.80mm      ← 지금 입력
+        1269×1063 AA     σ_u 0.398        → 4.00mm
+        2448×2048 이진   σ_u 0.295        → 2.97mm
+        2448×2048 AA     σ_u 0.204        → 2.05mm
+
+    즉 **원해상도로 저장만 해도 약 2배**, 거기에 안티에일리어싱을 켜면
+    약 2.8배 좋아진다. 둘 다 촬영·렌더 설정이지 알고리즘이 아니다.
+    """
+    f = float(cp["f_px"]); b = float(cp["b_m"])
+    z = float(z_m)
+    mm = lambda su_img: su_img * z * z / (f * b) * 1000.0
+    now = mm(sigma_u_img_px)
+    out = {"현재": round(now, 2)}
+    scale = 1.0
+    if sensor_w and cp.get("image_w"):
+        scale = float(sensor_w) / float(cp["image_w"])
+    if scale > 1.02:
+        out["원해상도로 저장"] = round(now / scale, 2)
+        out["해상도 배율"] = round(scale, 3)
+    if binary:
+        aa = 0.204 / 0.295          # 통제 실험에서 잰 AA 이득
+        base = out.get("원해상도로 저장", now)
+        out["+ 안티에일리어싱"] = round(base * aa, 2)
+    return out
+
+
+def _median_depth_of(lines_xyz):
+    Z = np.concatenate([np.asarray(v, float)[:, 2] for v in lines_xyz.values()])
+    return float(np.median(Z))
 
 
 def _line_planes_from_truth(truth, cp):
@@ -351,7 +399,7 @@ def _is_full_export(params, truth):
 
 def run(image, params=None, imu=None, truth=None, scene_image=None,
         out=None, profile=None, backend="geom", standoff_m=None,
-        site=None, pc_stride=20, verbose=True):
+        site=None, pc_stride=20, smooth=0, verbose=True):
     """
     이미지 한 장을 끝까지 돌려 엑셀 조서 하나를 만든다.
 
@@ -407,13 +455,14 @@ def run(image, params=None, imu=None, truth=None, scene_image=None,
 
     if full:
         return _run_full(image, params, truth, scene_image, imu, out, out_dir,
-                         name, rgb, qz, backend, site, pc_stride, say)
+                         name, rgb, qz, backend, site, pc_stride, say, smooth)
     return _run_plain(image, params, truth, scene_image, imu, out, out_dir,
-                      name, rgb, qz, backend, site, pc_stride, standoff_m, say)
+                      name, rgb, qz, backend, site, pc_stride, standoff_m, say,
+                      smooth)
 
 
 def _run_full(image, params, truth, scene_image, imu, out, out_dir, name,
-              rgb, qz, backend, site, pc_stride, say):
+              rgb, qz, backend, site, pc_stride, say, smooth=0):
     """
     정밀 경로 — load_capture 의 검증된 경로를 그대로 탄다.
 
@@ -449,6 +498,11 @@ def _run_full(image, params, truth, scene_image, imu, out, out_dir, name,
 
     say("\n  [2단계] 3D 복원 (검출 화소 → 깊이)")
     lines_in = LC.detected_lines_sensor(cap, det_eval)
+    if smooth:
+        half = float(qz.get("sigma_floor_px", 0.29)) * np.sqrt(12.0) / 2.0
+        half *= det_eval["scale_to_sensor"]
+        lines_in = DETECT.smooth_along_lines(lines_in, half, win=int(smooth))
+        say(f"    선따라 평활  창 {int(smooth)}점, 보정 한계 ±{half:.2f}px")
     lines_xyz, lines_uv, tri = PIPE.triangulate_lines(
         lines_in, cap["line_angles"], cp)
     n3d = sum(len(v) for v in lines_xyz.values())
@@ -456,6 +510,11 @@ def _run_full(image, params, truth, scene_image, imu, out, out_dir, name,
     say(f"    삼각측량 점 {n3d:,}   (V {nf.get('V', 0):,} + H {nf.get('H', 0):,})")
     depth = LC.verify_depth(lines_uv, lines_xyz, cap)
     if depth:
+        depth["개선예측_mm"] = improvement_forecast(
+            float(det_eval["err_noise_px"]), {**cp, "image_w": rgb.shape[1],
+                                              "f_px": det_eval["f_px_image"]},
+            _median_depth_of(lines_xyz), sensor_w=cp["resolution"][0],
+            binary=qz.get("binary", False))
         say(f"    깊이 오차   치우침 {depth['z_bias_mm']:+.2f}mm / "
             f"산포 {depth['z_noise_mm']:.2f}mm / RMS {depth['z_rms_mm']:.2f}mm"
             f"  ({depth['n_points']:,}점)")
@@ -467,7 +526,8 @@ def _run_full(image, params, truth, scene_image, imu, out, out_dir, name,
     say("\n  [3단계] 영역분할 → 수직도·수평도·평활도")
     res = PIPE.inspect_image(lines_uv, lines_xyz, cp, g_hat,
                              seg_backend=backend, sigma_u_px=su,
-                             line_gain=tri["line_gain"])
+                             line_gain=tri["line_gain"],
+                             aux_lines_uv=tri.get("skipped_uv"))
     res["triangulation"] = tri
     res["pixel_source"] = "detected"
     res["depth_check"] = depth
@@ -513,7 +573,7 @@ def _run_full(image, params, truth, scene_image, imu, out, out_dir, name,
 
 
 def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
-               rgb, qz, backend, site, pc_stride, standoff_m, say):
+               rgb, qz, backend, site, pc_stride, standoff_m, say, smooth=0):
     """
     기본 경로 — 이미지(+사양)만 있을 때.
 
@@ -597,6 +657,10 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
              2 * cyp - np.asarray(a, float)[..., 1]], axis=-1))
 
     say("\n  [2단계] 3D 복원 (검출 화소 → 깊이)")
+    if smooth:
+        half = float(qz.get("sigma_floor_px", 0.29)) * np.sqrt(12.0) / 2.0
+        detected = DETECT.smooth_along_lines(detected, half, win=int(smooth))
+        say(f"    선따라 평활  창 {int(smooth)}점, 보정 한계 ±{half:.2f}px")
     lines_xyz, lines_uv, tri = PIPE.triangulate_lines(detected, line_angles, cp)
     n3d = sum(len(v) for v in lines_xyz.values())
     if n3d == 0:
@@ -633,6 +697,9 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
             su_src = "이 이미지에서 실측"
         depth = _depth_vs_truth(lines_uv, lines_xyz, truth_data, cp, flipped)
         if depth:
+            depth["개선예측_mm"] = improvement_forecast(
+                su, cp, _median_depth_of(lines_xyz),
+                sensor_w=cp.get("sensor_w"), binary=qz.get("binary", False))
             say(f"    깊이 오차   치우침 {depth['z_bias_mm']:+.2f}mm / "
                 f"산포 {depth['z_noise_mm']:.2f}mm / "
                 f"RMS {depth['z_rms_mm']:.2f}mm  ({depth['n_points']:,}점)")
@@ -641,7 +708,8 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
     scene_rgb = read_image(scene_image) if scene_image else None
     res = PIPE.inspect_image(lines_uv, lines_xyz, cp, g_hat,
                              rgb_off=scene_rgb, seg_backend=backend,
-                             sigma_u_px=su, line_gain=tri["line_gain"])
+                             sigma_u_px=su, line_gain=tri["line_gain"],
+                             aux_lines_uv=tri.get("skipped_uv"))
     res["triangulation"] = tri
     res["pixel_source"] = "detected"
     res["depth_check"] = depth
@@ -1080,13 +1148,18 @@ def main():
     ap.add_argument("--standoff", type=float, default=None,
                     help="대표 측정거리 [m]")
     ap.add_argument("--site", default=None, help="현장명")
+    ap.add_argument("--smooth", type=int, default=0,
+                    help="선을 따라 N점 평활 (기본 0=끔). 보정량은 양자화 "
+                         "반폭으로 묶인다. 비스듬한 면에서 깊이 잡음이 "
+                         "줄지만(실측 4.32→2.93mm) 창 너비보다 좁은 요철은 "
+                         "뭉개진다")
     ap.add_argument("--pc-stride", type=int, default=20,
                     help="3D 좌표 표에 N개마다 한 점 (기본 20)")
     a = ap.parse_args()
     run(image=a.image, params=a.params, imu=a.imu, truth=a.truth,
         scene_image=a.scene, out=a.out, profile=a.profile,
         backend=a.backend, standoff_m=a.standoff, site=a.site,
-        pc_stride=a.pc_stride)
+        pc_stride=a.pc_stride, smooth=a.smooth)
     return 0
 
 

@@ -982,7 +982,8 @@ def evaluate_end_to_end(path, cap, det, backend="geom", sigma_u_px=None):
             return None
         r = PIPE.inspect_image(uv, xyz, cp, cap["g_hat"],
                               seg_backend=backend, sigma_u_px=su_px,
-                              line_gain=ti["line_gain"])
+                              line_gain=ti["line_gain"],
+                              aux_lines_uv=ti.get("skipped_uv"))
         best = {}
         for reg in r["regions"]:
             if reg["status"] != "measured":
@@ -1155,7 +1156,8 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
     print(f"\n  [3단계] 영역분할 → 수직도·수평도·평활도")
     res = PIPE.inspect_image(lines_uv, lines_xyz, cp, cap["g_hat"],
                              seg_backend=backend, sigma_u_px=su,
-                             line_gain=tri_info["line_gain"])
+                             line_gain=tri_info["line_gain"],
+                             aux_lines_uv=tri_info.get("skipped_uv"))
     res["triangulation"] = tri_info
     res["pixel_source"] = src
     res["depth_check"] = depth

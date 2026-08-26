@@ -378,7 +378,23 @@ def save_segmentation(path, result, base_image=None, shape=None,
     d = ImageDraw.Draw(im)
     rad = point_px if point_px else max(2, int(round(W / 700.0)))
 
-    counts = {}
+    counts, aux_counts = {}, {}
+    # 깊이를 못 주는 선(가로선)의 점을 **먼저** 깔고 그 위에 측정점을 얹는다.
+    # 겹치는 자리에서는 측정점이 보여야 한다.
+    for r in result.get("regions", []):
+        auv = r.get("aux_point_uv")
+        if auv is None or not len(auv):
+            continue
+        cls = r.get("class")
+        col = CLASS_COLOR.get(cls, (200, 200, 200))
+        # 같은 부재 색을 유지하되 어둡게 — 측정점과 구분되면서
+        # 어느 부재에 걸린 가로선인지는 색으로 바로 읽힌다.
+        col = tuple(int(c * 0.72) for c in col)
+        aux_counts[cls] = aux_counts.get(cls, 0) + len(auv)
+        ar = max(1, rad - 1)
+        for u, v in _tf(auv):
+            d.ellipse([u - ar, v - ar, u + ar, v + ar], fill=col)
+
     for r in result.get("regions", []):
         uv = r.get("point_uv")
         if uv is None:
@@ -438,11 +454,19 @@ def save_segmentation(path, result, base_image=None, shape=None,
                     d.text((tx, ty), txt, fill=col)
 
     # ── 범례 ──
-    rows = [(CLASS_COLOR.get(c, (200,) * 3),
-             f"{CLASS_KO.get(c, c) if ko else CLASS_EN.get(c, c)}  "
-             f"({c}, {n:,}점)" if ko else
-             f"{CLASS_EN.get(c, c)} ({c}, {n} pts)")
-            for c, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+    rows = []
+    for c, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        a = aux_counts.get(c, 0)
+        nm = CLASS_KO.get(c, c) if ko else CLASS_EN.get(c, c)
+        rows.append((CLASS_COLOR.get(c, (200,) * 3),
+                     (f"{nm}  ({c}, 측정 {n:,}점"
+                      + (f" + 가로 {a:,}점" if a else "") + ")") if ko
+                     else f"{nm} ({c}, {n} pts"
+                          + (f" +{a} aux" if a else "") + ")"))
+    if sum(aux_counts.values()):
+        rows.append(((110, 110, 118),
+                     "어두운 점 = 가로선 (깊이는 면에서 빌림, 검측 제외)" if ko
+                     else "dim = horizontal lines (projected, not measured)"))
     if n_def:
         rows.append((DEFECT_COLOR,
                      f"요철 {n_def}곳 (원 표시)" if ko
@@ -738,7 +762,7 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
     canvas = np.full((H, W, 3), 16, np.uint8)
 
     # 부재별 점·색
-    Ps, Cs, counts = [], [], {}
+    Ps, Cs, counts, aux_counts = [], [], {}, {}
     for r in regs:
         p = np.asarray(r["point_xyz"], float)
         if len(p) > max_points_per_region:      # 그림만 성기게, 통계는 전부
@@ -751,6 +775,21 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
         Ps.append(p @ R)
         Cs.append(np.repeat(col[None, :], len(p), axis=0))
         counts[cls] = counts.get(cls, 0) + int(len(r["point_xyz"]))
+
+        # 가로선 점 — 면에서 거리를 빌려 온 유도값이다. 같은 부재 색을
+        # 옅게 써서 "어디에 걸렸는지" 는 보이되 측정점과 구분되게 한다.
+        a = r.get("aux_point_xyz")
+        if a is not None and len(a):
+            a = np.asarray(a, float)
+            if len(a) > max_points_per_region:
+                idx = np.linspace(0, len(a) - 1,
+                                  max_points_per_region).astype(int)
+                a = a[idx]
+            acol = (col.astype(float) * 0.72).clip(0, 255).astype(np.uint8)
+            Ps.append(a @ R)
+            Cs.append(np.repeat(acol[None, :], len(a), axis=0))
+            aux_counts[cls] = aux_counts.get(cls, 0) + int(
+                len(r["aux_point_xyz"]))
     P = np.vstack(Ps); C = np.vstack(Cs)
 
     # 요철 3D 좌표 (있으면)
@@ -772,7 +811,9 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
     d0 = ImageDraw.Draw(im)
 
     top = int(fs * 2.6)                         # 제목 줄
-    legend_h = int(fs * 1.9) * (len(counts) + (1 if len(D) else 0)) + fs * 2
+    n_rows = (len(counts) + (1 if len(D) else 0)
+              + (1 if sum(aux_counts.values()) else 0))
+    legend_h = int(fs * 1.9) * n_rows + fs * 3
     body_h = H - top - legend_h
     pw, ph = W // 2, body_h // 2
     panels = [
@@ -813,7 +854,10 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
 
     ttl = title or ("3D 점군 — 부재별" if ko else "3D point cloud by member")
     _txt((16, fs // 2), ttl)
-    sub = (f"중력 정렬 좌표 · 점 {len(P):,}개 · 등척"
+    n_aux = sum(aux_counts.values())
+    sub = ((f"중력 정렬 좌표 · 점 {len(P):,}개"
+            + (f" (측정 {len(P)-n_aux:,} + 가로 {n_aux:,})" if n_aux else "")
+            + " · 등척")
            if ko else f"gravity-aligned, {len(P)} pts, equal scale")
     _txt((16 + _len(ttl) + fs, fs // 2 + 2), sub, fill=(150, 155, 165))
 
@@ -867,10 +911,19 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
          fill=(150, 155, 165))
     for cls, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         col = CLASS_COLOR.get(cls, (200, 200, 200))
+        a = aux_counts.get(cls, 0)
         d.rectangle([16, y + 4, 16 + fs, y + fs], fill=col)
         nm = (CLASS_KO.get(cls, cls) if ko else CLASS_EN.get(cls, cls))
-        _txt((16 + fs * 2, y), f"{nm}  ({cls}, {n:,}점)" if ko
-             else f"{nm} ({cls}, {n} pts)")
+        _txt((16 + fs * 2, y),
+             (f"{nm}  ({cls}, 측정 {n:,}점"
+              + (f" + 가로 {a:,}점" if a else "") + ")") if ko
+             else f"{nm} ({cls}, {n} pts" + (f" +{a} aux" if a else "") + ")")
+        y += int(fs * 1.9)
+    if sum(aux_counts.values()):
+        _txt((16 + fs * 2, y),
+             ("어두운 점 = 가로선 — 깊이는 면에서 빌린 값이라 검측에는 안 쓴다"
+              if ko else "faint = horizontal lines (projected, not measured)"),
+             fill=(150, 155, 165))
         y += int(fs * 1.9)
     if len(D):
         d.ellipse([16, y + 3, 16 + fs, y + fs + 1], outline=DEFECT_COLOR,
@@ -911,7 +964,7 @@ def region_xyz_rows(result, g_hat=None, stride=1):
         Pw = P @ R if R is not None else None
         for j in range(0, len(P), max(1, int(stride))):
             row = {"부재번호": i + 1, "클래스": r.get("class"),
-                   "판정대상": r.get("kind"),
+                   "판정대상": r.get("kind"), "구분": "측정",
                    "선ID": (str(lid[j]) if lid is not None and j < len(lid)
                             else None),
                    "X_m": round(float(P[j, 0]), 5),
@@ -921,6 +974,27 @@ def region_xyz_rows(result, g_hat=None, stride=1):
                 row.update({"가로_m": round(float(Pw[j, 0]), 5),
                             "깊이_m": round(float(Pw[j, 1]), 5),
                             "높이_m": round(float(Pw[j, 2]), 5)})
+            rows.append(row)
+
+        # 가로선 점 — 거리를 면에서 빌려 온 유도값. 좌표는 실제 화소에서
+        # 나온 것이라 위치는 맞지만, 그 면에 대한 잔차가 정의상 0 이므로
+        # 검측에는 쓰지 않았다. 구분 열로 표시한다.
+        A = r.get("aux_point_xyz")
+        if A is None or not len(A):
+            continue
+        A = np.asarray(A, float)
+        Aw = A @ R if R is not None else None
+        for j in range(0, len(A), max(1, int(stride))):
+            row = {"부재번호": i + 1, "클래스": r.get("class"),
+                   "판정대상": r.get("kind"), "구분": "가로선(면에 투영)",
+                   "선ID": None,
+                   "X_m": round(float(A[j, 0]), 5),
+                   "Y_m": round(float(A[j, 1]), 5),
+                   "Z_m": round(float(A[j, 2]), 5)}
+            if Aw is not None:
+                row.update({"가로_m": round(float(Aw[j, 0]), 5),
+                            "깊이_m": round(float(Aw[j, 1]), 5),
+                            "높이_m": round(float(Aw[j, 2]), 5)})
             rows.append(row)
     return rows
 
@@ -945,6 +1019,8 @@ def region_xyz_summary(result, g_hat=None):
             "부재번호": i + 1, "클래스": r.get("class"),
             "검측": r.get("kind"), "상태": r.get("status"),
             "점수": int(len(P)),
+            "가로선점수": int(len(r["aux_point_xyz"])
+                       if r.get("aux_point_xyz") is not None else 0),
             "선구성": (" / ".join(f"{k} {v:,}점" for k, v in sorted(fams.items()))
                     or None),
             "깊이이득_RMS": r.get("depth_gain_rms"),

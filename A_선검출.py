@@ -626,6 +626,51 @@ def _validate_and_fix(out, lids, centers_hint, raycast,
 # =====================================================================
 # 핵심 추적 함수 (v7 계승 + 개선)
 # =====================================================================
+def smooth_along_lines(lines_uv, half_px, win=31):
+    """
+    선을 따라 저역통과. 보정량을 **양자화 반폭 half_px 로 묶는다**.
+
+    왜 되는가
+    --------
+    이진 렌더에서 선 중심은 0.5px 격자에만 떨어진다. 선이 이미지에서
+    기울어 있으면(비스듬한 면) 행마다 격자 위상이 달라져 반올림 오차가
+    행마다 독립에 가까워지고, 그러면 평균이 참값으로 수렴한다. 실측:
+    바닥 장면 깊이 산포 4.32mm → 2.93mm (창 41).
+
+    왜 벽에서는 안 되는가
+    -------------------
+    정면 벽의 세로선은 모든 행에서 u 가 같아 격자 위상이 고정된다.
+    반올림 오차가 선 전체에 **같은 값** 으로 실리므로 평균해도 그대로다
+    (실측 5.08 → 4.99mm). 이때는 이미지를 고치는 수밖에 없다.
+
+    왜 묶는가
+    --------
+    보정량을 양자화 반폭 안으로 제한하면, 이 함수는 "측정이 애초에
+    구분하지 못한 구간 안에서만" 점을 움직인다. 실제 표면 특징을
+    창 너비만큼 뭉개기는 하지만, 없는 것을 만들거나 있는 것을 없앨 수는
+    없다. 창은 분해하려는 요철 크기보다 충분히 작게 잡아야 한다.
+    """
+    if not lines_uv or half_px <= 0:
+        return lines_uv
+    k = max(3, int(win) | 1)
+    out = {}
+    for lid, uv in lines_uv.items():
+        a = np.asarray(uv, float)
+        if len(a) < k:
+            out[lid] = a
+            continue
+        ax = 0 if str(lid).startswith("V") else 1      # 측정축
+        sc = 1 - ax                                    # 스캔축
+        o = np.argsort(a[:, sc])
+        a = a[o].copy()
+        x = a[:, ax]
+        pad = np.pad(x, (k // 2, k // 2), mode="edge")
+        sm = np.convolve(pad, np.ones(k) / k, mode="valid")
+        a[:, ax] = x + np.clip(sm - x, -half_px, half_px)
+        out[lid] = a
+    return out
+
+
 def _box_blur(a, k):
     """분리형 박스 필터. scipy 없이 누적합으로 돌린다 (O(N))."""
     if k < 2:

@@ -116,6 +116,89 @@ def _defects_in_image(fd, camera_params):
     return out
 
 
+def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):
+    """
+    깊이를 못 주는 선(굴리지 않은 가로선)의 화소를 **이미 맞춘 면 위에**
+    올려 3D 위치를 준다.
+
+    왜 필요한가
+    ----------
+    가로선은 원리적으로 깊이를 못 준다(eq7 이득 g=∞). 그렇다고 결과
+    그림에서 빼 버리면 "격자가 실제로 어디에 걸렸는지" 가 안 보인다.
+    검출은 분명히 됐고(21/21), 화소 위치는 정확하다 — 없는 것은 그 점의
+    **거리** 뿐이다.
+
+    그래서 거리는 검측이 이미 구한 면에서 빌려 온다. 화소 하나는 카메라
+    광선 하나를 정하고, 그 광선이 어느 면과 먼저 만나는지는 풀 수 있다.
+    레이저는 가장 앞에 있는 면에 맺히므로 **가장 가까운 교점** 이 답이다.
+
+        P = Z·(û, v̂, 1) + (b, 0, 0)  가 면 위    →  Z 를 푼다
+
+    반드시 지켜야 할 것 — 이 점은 **측정값이 아니라 유도값** 이다. 면에서
+    빌려 온 거리이므로 그 면에 대한 잔차가 정의상 0 이고, 평활도·수직도
+    계산에 넣으면 결과를 스스로 확인하는 꼴이 된다. 그래서 검측에는
+    절대 넣지 않고 aux_ 접두어로 따로 들고 다니며, 조서와 그림에도
+    "투영" 이라고 표시한다.
+    """
+    if not aux_lines_uv:
+        return 0
+    f = float(camera_params["f_px"]); b = float(camera_params["b_m"])
+    cx = float(camera_params["cx_px"]); cy = float(camera_params["cy_px"])
+
+    # 면으로 확정된 영역만 후보다. 선형 부재(동바리·철근)는 면이 없다.
+    cands = []
+    for k, r in enumerate(results):
+        pl = r.get("plane")        # (a, b, c, d) — aX+bY+cZ+d = 0
+        if not pl or len(pl) != 4 or r.get("status") != "measured":
+            continue
+        P = np.asarray(r["point_xyz"], float)
+        cands.append({"idx": k, "n": np.asarray(pl[:3], float),
+                      "d": float(pl[3]),
+                      "lo": P.min(axis=0) - margin_m,
+                      "hi": P.max(axis=0) + margin_m})
+        r.setdefault("aux_point_uv", [])
+        r.setdefault("aux_point_xyz", [])
+    if not cands:
+        return 0
+
+    n_placed = 0
+    for lid, uv in aux_lines_uv.items():
+        A = np.asarray(uv, float).reshape(-1, 2)
+        uh = (A[:, 0] - cx) / f
+        vh = (A[:, 1] - cy) / f
+        best_z = np.full(len(A), np.inf)
+        best_i = np.full(len(A), -1, dtype=int)
+        for c in cands:
+            n, d = c["n"], c["d"]
+            den = n[0] * uh + n[1] * vh + n[2]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                Z = -(d + n[0] * b) / den
+            P = np.column_stack([b + Z * uh, Z * vh, Z])
+            ok = (np.isfinite(Z) & (Z > 0.05) & (Z < 60.0)
+                  & np.all(P >= c["lo"], axis=1) & np.all(P <= c["hi"], axis=1)
+                  & (Z < best_z))
+            best_z[ok] = Z[ok]
+            best_i[ok] = c["idx"]
+        for c in cands:
+            m = best_i == c["idx"]
+            if not m.any():
+                continue
+            Z = best_z[m]
+            P = np.column_stack([b + Z * uh[m], Z * vh[m], Z])
+            results[c["idx"]]["aux_point_uv"].append(A[m])
+            results[c["idx"]]["aux_point_xyz"].append(P)
+            n_placed += int(m.sum())
+
+    for c in cands:
+        r = results[c["idx"]]
+        r["aux_point_uv"] = (np.vstack(r["aux_point_uv"])
+                             if r["aux_point_uv"] else np.empty((0, 2)))
+        r["aux_point_xyz"] = (np.vstack(r["aux_point_xyz"])
+                              if r["aux_point_xyz"] else np.empty((0, 3)))
+        r["n_aux_points"] = int(len(r["aux_point_xyz"]))
+    return n_placed
+
+
 def measure_region(points_3d, cls, g_hat, camera_params,
                    flatness_threshold_mm=1.5, sigma_u_px=0.2,
                    target_sigma_mm=2.0, member_length_m=None):
@@ -358,7 +441,8 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
                   erode_default_px=3, erode_thin_px=1,
                   min_region_points=12, sigma_u_px=0.2,
                   target_sigma_mm=2.0, flatness_threshold_mm=1.5,
-                  split_incoherent=True, line_gain=None):
+                  split_incoherent=True, line_gain=None,
+                  aux_lines_uv=None):
     """
     선검출 결과 + 삼각측량 결과 + 세그멘테이션으로 영역별 검측을 수행한다.
 
@@ -376,6 +460,10 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
         RMS 이득으로 σ_u 를 부풀려 불확실도를 계산한다. 이득이 큰
         선(굴린 격자의 가로선)의 점은 같은 화소 오차라도 깊이가 더
         흔들리므로, 이걸 반영하지 않으면 평활도가 실제보다 좋게 나온다.
+    aux_lines_uv : {lid: (N,2)} | None
+        깊이를 못 준 선의 화소 (triangulate_lines 의 skipped_uv).
+        주면 이미 맞춘 면 위에 올려 그림에만 표시한다 — 검측에는 쓰지
+        않는다(면에서 빌려 온 거리라 잔차가 정의상 0 이다).
 
     Returns
     -------
@@ -535,6 +623,15 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
             r["point_lid"] = table["lid"][keep]
             results.append(r)
 
+    # 깊이를 못 주는 선(가로선)의 화소도 결과 그림에는 나와야 한다.
+    # 검측에는 넣지 않고 aux_ 로 따로 들고 간다.
+    n_aux = 0
+    if aux_lines_uv:
+        try:
+            n_aux = place_aux_points(results, aux_lines_uv, camera_params)
+        except Exception:
+            n_aux = 0
+
     measured = [r for r in results if r["status"] == "measured"]
     summary = {
         "n_regions": len(results),
@@ -545,6 +642,7 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
                                  if r["label_fusion"]["source"] == "geometric"),
         "regions_split": n_split,
         "linear_members_rescued": n_linear_rescued,
+        "aux_points": int(n_aux),
         "flatness_unmeasurable": sum(
             1 for r in measured
             if (r["flatness"] or {}).get("judgement") == "측정불가"),
@@ -611,6 +709,9 @@ def triangulate_lines(lines_pixels, line_angles, camera_params,
     lines_uv  : {lid: [(u,v), ...]}   삼각측량에 성공한 점만 (순서 일치)
     info      : dict
         skipped     : [(lid, 사유), ...]
+        skipped_uv  : {lid: (N,2)}  버린 선의 화소. 깊이는 못 주지만
+                      결과 그림에는 찍어야 한다 — 실제로 검출된 점이고,
+                      가로선까지 나와야 격자가 어디에 걸렸는지 보인다.
         line_gain   : {lid: g}          쓰인 선의 깊이 이득
         family      : eq7.family_summary  V/H 계열 요약
         n_by_family : {"V": 점수, "H": 점수}
@@ -626,6 +727,7 @@ def triangulate_lines(lines_pixels, line_angles, camera_params,
     planes = _EQ7.line_planes(line_angles, tilt_rad=tilt, roll_rad=roll)
 
     lines_xyz, lines_uv, skipped = {}, {}, []
+    skipped_uv = {}
     line_gain, n_by_family = {}, {}
     for lid, pts in lines_pixels.items():
         pl = planes.get(lid)
@@ -635,9 +737,11 @@ def triangulate_lines(lines_pixels, line_angles, camera_params,
         g = pl["gain"]
         if not np.isfinite(g):
             skipped.append((lid, "깊이 정보 없음 (평면이 기선을 품음, g=∞)"))
+            skipped_uv[lid] = np.asarray(pts, float).reshape(-1, 2)
             continue
         if g > gmax:
             skipped.append((lid, f"깊이 이득 과대 (g={g:.1f} > {gmax:g})"))
+            skipped_uv[lid] = np.asarray(pts, float).reshape(-1, 2)
             continue
         arr = np.asarray(pts, dtype=float).reshape(-1, 2)
         if len(arr) == 0:
@@ -652,7 +756,8 @@ def triangulate_lines(lines_pixels, line_angles, camera_params,
         fam = lid[0]
         n_by_family[fam] = n_by_family.get(fam, 0) + len(xyz)
 
-    info = {"skipped": skipped, "line_gain": line_gain,
+    info = {"skipped": skipped, "skipped_uv": skipped_uv,
+            "line_gain": line_gain,
             "family": _EQ7.family_summary(planes),
             "n_by_family": n_by_family, "max_depth_gain": gmax}
     return lines_xyz, lines_uv, info
@@ -693,6 +798,7 @@ def inspect_capture(lines_pixels, line_angles, camera_params, R_world_cam,
                   if backend == "gt" else {})
 
     kw.setdefault("line_gain", tri_info["line_gain"])
+    kw.setdefault("aux_lines_uv", tri_info.get("skipped_uv"))
     res = inspect_image(lines_uv, lines_xyz, camera_params, g_hat,
                         rgb_off=rgb_off, seg_backend=backend,
                         seg_kwargs=seg_kwargs, **kw)
