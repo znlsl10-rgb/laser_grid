@@ -721,7 +721,7 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
                "가로선 점수", "선 구성", "깊이이득", "부재 반폭(mm)",
                "폭 근거", "중심 X(m)", "중심 Y(m)",
                "중심 Z(m)", "거리범위(m)", "가로폭(m)", "깊이폭(m)",
-               "높이폭(m)", "크기 해석"])
+               "측정 구간(m)", "길이 확정?", "길이 근거"])
     for r in rows:
         # 크기를 어떻게 읽어야 하는지 한 칸에 적는다. 숫자만 두면
         # 거리 때문에 달라진 값을 부재 길이 차이로 오해한다.
@@ -741,8 +741,13 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
             r.get("부재반폭_mm"), r.get("폭_근거"),
             r["중심_X_m"], r["중심_Y_m"], r["중심_Z_m"],
             f"{r['거리범위_m'][0]} ~ {r['거리범위_m'][1]}",
-            r.get("가로폭_m"), r.get("깊이폭_m"), r.get("높이폭_m"),
-            how])
+            r.get("가로폭_m"), r.get("깊이폭_m"),
+            # 하한이면 숫자 앞에 ≥ 를 붙인다. 표를 훑는 사람이 주석까지
+            # 읽지 않아도 "이건 길이가 아니다" 가 눈에 들어와야 한다.
+            ((f"≥ {r.get('측정구간_m')}" if r.get("길이확정") == "하한"
+              else r.get("측정구간_m")) if r.get("측정구간_m") is not None
+             else None),
+            r.get("길이확정"), r.get("길이근거") or how])
     if not rows:
         ws.append(["3D 점이 없다 — 삼각측량 단계를 확인할 것"])
     _style(ws, openpyxl,
@@ -858,7 +863,12 @@ def save_excel(path, result, meta=None, label_pixels=None,
     _sheet_flatness(wb, openpyxl, result)
     _sheet_defects(wb, openpyxl, result, seg_image_path)
     _sheet_pointcloud_xyz(wb, openpyxl, result, g_hat=g_hat, stride=pc_stride)
-    _sheet_caveats(wb, openpyxl, record, extra_caveats)
+    # '동바리 높이가 제각각' 으로 읽히는 것을 막는 설명은 조서에도 남긴다.
+    _sn = (result.get("summary") or {}).get("span_note")
+    _cav = list(extra_caveats or [])
+    if _sn:
+        _cav.insert(0, _sn)
+    _sheet_caveats(wb, openpyxl, record, _cav)
     # 탭 순서를 파이프라인 순서로 맞춘다 — 선검출 → 깊이 → 분할/3D → 검측
     order = ["1.요약", "2.설계값", "3.선검출(1단계)", "4.깊이검증(2단계)",
              "5.세그멘테이션(3단계)", "6.검측결과", "7.평활도상세",

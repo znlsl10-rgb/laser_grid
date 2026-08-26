@@ -867,6 +867,84 @@ def split_incoherent_region(xyz, cls, g_hat, min_points=12,
 # =====================================================================
 # 한 장 전체 검측
 # =====================================================================
+def finalize_extents(result):
+    """
+    각 영역의 끝이 "부재의 끝" 인지 "격자가 닿은 데까지" 인지 가르고,
+    선형 부재의 구간이 서로 다른 이유를 한 줄로 정리한다.
+
+    inspect_image 안에 있던 것을 밖으로 뺐다 — 이 판단만 따로 검증할 수
+    있어야 한다(회귀 [18]). result 를 제자리에서 고치고 span_note 를
+    summary 에 넣어 돌려준다.
+    """
+    regions = result.get("regions") or []
+    # 각 영역의 끝이 "부재의 끝" 인지 "격자가 닿은 데까지" 인지 가른다.
+    # 셋 다 같은 화소 구간을 훑었는데 거리가 달라 미터값만 달라진 경우를
+    # 부재 길이 차이로 읽으면 안 된다(실측: 동바리 세 본 1.99/1.93/1.87m,
+    # 거리 1.705/1.652/1.595m — 비율이 정확히 같다).
+    boxes = [r["point_uv_box"] for r in regions if r.get("point_uv_box")]
+    if boxes:
+        B = np.asarray(boxes, float)
+        gx0, gy0 = float(B[:, 0].min()), float(B[:, 1].min())
+        gx1, gy1 = float(B[:, 2].max()), float(B[:, 3].max())
+        mg = 0.01 * max(gx1 - gx0, gy1 - gy0, 1.0)
+        for r in regions:
+            bx = r.get("point_uv_box")
+            if not bx:
+                continue
+            lo_x, lo_y = bx[0] <= gx0 + mg, bx[1] <= gy0 + mg
+            hi_x, hi_y = bx[2] >= gx1 - mg, bx[3] >= gy1 - mg
+            r["extent_limited"] = bool(lo_x or lo_y or hi_x or hi_y)
+            # ── 선형 부재는 **양 끝을 따로** 봐야 한다 ──
+            # 세 동바리가 1.9938 / 1.9317 / 1.8652 m 로 서로 다르게 나왔는데,
+            # 거리(1.705 / 1.652 / 1.595 m)로 나누면 1.16938 / 1.16932 /
+            # 1.16941 — 다섯 자리까지 같다. 셋 다 화소 구간이 같았을 뿐이다.
+            # 격자는 고정된 화각을 덮으므로 덮는 미터 길이가 거리에 비례한다.
+            # 즉 이 값은 부재 높이가 아니라 **격자가 스친 구간** 이고, 양 끝이
+            # 격자 경계에 닿아 있으면 부재 길이는 그 값 **이상** 이라는 것밖에
+            # 모른다. 그걸 '높이' 로 내보내면 같은 규격 부재가 서로 다른
+            # 높이로 읽힌다.
+            if r.get("kind") == "axis_vertical":
+                r["extent_ends"] = {"위쪽": bool(lo_y), "아래쪽": bool(hi_y)}
+                r["length_is_lower_bound"] = bool(lo_y or hi_y)
+            else:
+                r["length_is_lower_bound"] = bool(r["extent_limited"])
+
+    # ── 선형 부재의 구간이 서로 다른 이유를 조서가 직접 말하게 한다 ──
+    # 격자는 고정 화각을 덮으므로 덮는 미터 길이가 거리에 비례한다. 양 끝이
+    # 격자 한계에 닿은 부재들의 구간/거리 비가 같으면, 길이가 다른 게 아니라
+    # 같은 화소 구간을 서로 다른 거리에서 본 것이다. 사람이 표만 보고
+    # "동바리 높이가 제각각" 이라고 읽지 않도록 근거를 숫자로 남긴다.
+    span_note = None
+    lin = [r for r in regions
+           if r.get("kind") == "axis_vertical" and r.get("status") == "measured"
+           and r.get("length_is_lower_bound")
+           and (r.get("axis") or {}).get("length_m")
+           and r.get("point_xyz") is not None and len(r["point_xyz"])]
+    if len(lin) >= 2:
+        rows = []
+        for r in lin:
+            L = float(r["axis"]["length_m"])
+            z = float(np.median(np.asarray(r["point_xyz"], float)[:, 2]))
+            if z > 1e-6:
+                rows.append((L, z, L / z))
+        if len(rows) >= 2:
+            ratio = np.array([t[2] for t in rows], float)
+            spread = float(np.ptp(ratio) / max(np.mean(ratio), 1e-9))
+            for r, t in zip(lin, rows):
+                r["span_per_depth"] = round(float(t[2]), 5)
+            if spread < 0.01:
+                span_note = (
+                    "선형 부재 " + str(len(rows)) + "본의 측정 구간이 서로 "
+                    "다른 것은 **거리 차이** 때문이다 — "
+                    + " / ".join(f"{L:.4f}m ÷ {z:.3f}m" for L, z, _ in rows)
+                    + f" = {ratio.mean():.5f} 로 모두 같다(편차 "
+                      f"{spread * 100:.2f}%). 격자가 고정 화각을 덮으므로 "
+                      "덮는 길이가 거리에 비례하고, 셋 다 같은 화소 구간을 "
+                      "봤다는 뜻이다. 부재 길이가 다르다는 근거가 아니다.")
+    result.setdefault("summary", {})["span_note"] = span_note
+    return span_note
+
+
 def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
                   rgb_off=None, seg_backend="gt", seg_kwargs=None,
                   erode_default_px=3, erode_thin_px=1,
@@ -1092,24 +1170,8 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
         except Exception:
             n_cross = 0
 
-    # 각 영역의 끝이 "부재의 끝" 인지 "격자가 닿은 데까지" 인지 가른다.
-    # 셋 다 같은 화소 구간을 훑었는데 거리가 달라 미터값만 달라진 경우를
-    # 부재 길이 차이로 읽으면 안 된다(실측: 동바리 세 본 1.99/1.93/1.87m,
-    # 거리 1.705/1.652/1.595m — 비율이 정확히 같다).
-    boxes = [r["point_uv_box"] for r in results if r.get("point_uv_box")]
-    if boxes:
-        B = np.asarray(boxes, float)
-        gx0, gy0 = float(B[:, 0].min()), float(B[:, 1].min())
-        gx1, gy1 = float(B[:, 2].max()), float(B[:, 3].max())
-        mg = 0.01 * max(gx1 - gx0, gy1 - gy0, 1.0)
-        for r in results:
-            bx = r.get("point_uv_box")
-            if not bx:
-                continue
-            r["extent_limited"] = bool(
-                bx[0] <= gx0 + mg or bx[1] <= gy0 + mg
-                or bx[2] >= gx1 - mg or bx[3] >= gy1 - mg)
-
+    span_note = finalize_extents({"regions": results,
+                                 "summary": {}})
     measured = [r for r in results if r["status"] == "measured"]
     summary = {
         "n_regions": len(results),
@@ -1122,6 +1184,7 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
         "linear_members_rescued": n_linear_rescued,
         "aux_points": int(n_aux),
         "crossing_resolved": int(n_cross),
+        "span_note": span_note,
         "flatness_unmeasurable": sum(
             1 for r in measured
             if (r["flatness"] or {}).get("judgement") == "측정불가"),
@@ -1346,6 +1409,10 @@ def format_report(result):
             lines.append(f"      ↳ 라벨 교정: {r['label_fusion_note']}")
         if f.get("judgement") == "측정불가":
             lines.append(f"      ↳ {f['note']}")
+    sn = (result.get("summary") or {}).get("span_note")
+    if sn:
+        lines.append("")
+        lines.append("  [측정 구간] " + sn)
     return "\n".join(lines)
 
 

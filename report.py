@@ -1066,9 +1066,20 @@ def region_xyz_summary(result, g_hat=None):
             rec.update({
                 "가로폭_m": round(float(np.ptp(Pw[:, 0])), 4),
                 "깊이폭_m": round(float(np.ptp(Pw[:, 1])), 4),
-                "높이폭_m": round(float(np.ptp(Pw[:, 2])), 4),
+                "측정구간_m": round(float(np.ptp(Pw[:, 2])), 4),
                 "높이범위_m": [round(float(Pw[:, 2].min()), 3),
                            round(float(Pw[:, 2].max()), 3)]})
+            # 이 값이 부재 길이인지, 격자가 스친 구간일 뿐인지 함께 낸다.
+            # 이름을 '높이' 로 두면 같은 규격 동바리가 거리 때문에 서로
+            # 다른 높이로 읽힌다 (실측 1.9938 / 1.9317 / 1.8652 m).
+            lb = bool(r.get("length_is_lower_bound"))
+            ends = r.get("extent_ends") or {}
+            cut = [k for k, v in ends.items() if v]
+            rec["길이확정"] = ("하한" if lb else "확정")
+            rec["길이근거"] = (
+                ("부재 전체가 측정 범위 안 — 이 값이 길이다" if not lb
+                 else ("격자가 " + "·".join(cut) + " 끝에서 잘림 — 부재는 이보다 길다"
+                       if cut else "격자·화면 경계에 닿음 — 이 값은 하한이다")))
         out.append(rec)
     return out
 

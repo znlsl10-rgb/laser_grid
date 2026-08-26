@@ -1043,6 +1043,62 @@ def test_pointcloud_plot():
               P3.save_pointcloud_mpl(out2, res, g_hat=g, views="iso") == out2)
 
 
+def test_member_span_reporting():
+    """[18] 같은 규격 부재가 거리 때문에 다른 길이로 읽히지 않는가"""
+    print("\n[18] 측정 구간 — '동바리 높이가 제각각' 문제")
+    g = np.array([0.0, 1.0, 0.0])
+    cp = {"f_px": 1593.0, "b_m": 0.15, "cx_px": 1224.0, "cy_px": 1024.0,
+          "image_w": 2448, "image_h": 2048}
+    # 같은 화소 구간(v 92~1955)을 서로 다른 거리에서 본 동바리 3본.
+    # 격자가 고정 화각을 덮으므로 덮는 미터 길이가 거리에 비례한다.
+    v = np.linspace(92.0, 1955.0, 400)
+    spans, zs = [], (1.705, 1.652, 1.595)
+    for z in zs:
+        Y = (v - cp["cy_px"]) * z / cp["f_px"]
+        spans.append(float(np.ptp(Y)))
+    ratio = [sp / z for sp, z in zip(spans, zs)]
+    check(f"구간/거리 비가 같다 ({ratio[0]:.5f} / {ratio[1]:.5f} / "
+          f"{ratio[2]:.5f})",
+          max(ratio) - min(ratio) < 1e-6 * max(ratio))
+    check(f"그런데 구간 자체는 다르다 ({spans[0]:.4f} / {spans[1]:.4f} / "
+          f"{spans[2]:.4f} m) — 이걸 '높이' 로 내보내면 오해가 생긴다",
+          max(spans) - min(spans) > 0.10)
+
+    # 파이프라인이 이 상황을 '하한' 으로 표시하고 이유를 남기는가
+    res = {"regions": []}
+    for k, z in enumerate(zs):
+        Y = (v - cp["cy_px"]) * z / cp["f_px"]
+        P = np.column_stack([np.full_like(Y, -0.5 + 0.6 * k), Y,
+                             np.full_like(Y, z)])
+        res["regions"].append({
+            "class": "shoring", "kind": "axis_vertical", "status": "measured",
+            "point_xyz": P, "point_uv": np.column_stack([
+                np.full_like(v, 300.0 + 700.0 * k), v]),
+            "point_uv_box": [300.0 + 700.0 * k, 92.0,
+                             300.0 + 700.0 * k, 1955.0],
+            "axis": {"length_m": float(np.ptp(Y))},
+            "judge": {"is_pass": True}, "flatness": {}})
+    PIPE.finalize_extents(res)
+    lb = [r.get("length_is_lower_bound") for r in res["regions"]]
+    check(f"양 끝이 격자 한계면 길이는 하한으로 표시 ({lb})", all(lb))
+    ends = res["regions"][0].get("extent_ends") or {}
+    check(f"어느 끝이 잘렸는지 남는다 ({ends})",
+          ends.get("위쪽") and ends.get("아래쪽"))
+    note = (res.get("summary") or {}).get("span_note")
+    check("조서가 '거리 차이 때문' 이라고 직접 적는다",
+          bool(note) and "거리 차이" in note and "부재 길이가 다르다는 근거가 "
+          "아니다" in note)
+
+    # 부재 전체가 화면 안이면 하한이 아니라 확정이어야 한다
+    res2 = {"regions": [dict(res["regions"][0])]}
+    res2["regions"][0] = dict(res2["regions"][0])
+    res2["regions"][0]["point_uv_box"] = [300.0, 400.0, 300.0, 1600.0]
+    res2["regions"].append(dict(res["regions"][1]))
+    PIPE.finalize_extents(res2)
+    check("부재가 격자 안에서 끝나면 '확정'",
+          res2["regions"][0].get("length_is_lower_bound") is False)
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -1055,7 +1111,7 @@ def main():
               test_pointcloud_export, test_rolled_grid_detection,
               test_run_pipeline_inputs, test_single_line_member,
               test_silhouette_recovery, test_line_gap_recovery,
-              test_pointcloud_plot):
+              test_pointcloud_plot, test_member_span_reporting):
         t()
     print("\n" + "=" * 70)
     if _FAILS:
