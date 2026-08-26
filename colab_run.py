@@ -358,20 +358,15 @@ def _show(res):
         from IPython.display import display, Image
     except Exception:
         return
+    # 판정표 한 장만 미리 보여 준다. 나머지는 조서를 열어 보면 된다 —
+    # 셀에서 시트를 여럿 들추면 열 이름이 하나만 달라져도 통째로 죽는다.
     try:
         import pandas as pd
-        for sheet, cols in (("6.검측결과", None),
-                            ("9.3D좌표(부재별)",
-                             ["부재", "클래스", "검측", "격자선 수",
-                              "측정 점수", "가로선 점수", "부재 반폭(mm)",
-                              "폭 근거"])):
-            df = pd.read_excel(res["xlsx"], sheet_name=sheet)
-            if cols:
-                df = df[[c for c in cols if c in df.columns]]
-            print(f"\n── {sheet} ──")
-            display(df)
+        df = pd.read_excel(res["xlsx"], sheet_name="6.검측결과")
+        print("\n── 6.검측결과 ──")
+        display(df)
     except Exception as e:
-        print(f"  [알림] 표 미리보기 생략 ({e})")
+        print(f"  [알림] 표 미리보기 생략 ({type(e).__name__}: {e})")
     for k in ("세그멘테이션", "3D점군", "3D점군(등각)", "선검출대조"):
         p = (res.get("images") or {}).get(k)
         if p and os.path.exists(p):
