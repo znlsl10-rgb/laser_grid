@@ -404,19 +404,6 @@ def make_line_angles(n_v=None, n_h=None, fov_deg=None, laser_tilt_deg=None,
     return a
 
 
-def predicted_u(alpha_rad, z_m, camera_params=None):
-    """
-    발사각 α 의 V선이 거리 z_m 에서 이미지의 어디에 맺히는지.
-
-        u = f·tan(α) − f·b/Z + c_x
-
-    두 번째 항이 기선 때문에 생기는 시차 이동이다. 이 항을 빼먹으면
-    예측 위치가 1.2m 에서 435px 어긋나, 추적 밴드(20~50px) 밖으로 나간다.
-    """
-    cp = camera_params or CAMERA_PARAMS
-    return cp["f_px"] * np.tan(alpha_rad) - cp["f_px"] * cp["b_m"] / z_m + cp["cx_px"]
-
-
 # 값의 출처 등급 — 문서·보고서가 이 표를 그대로 쓴다.
 # 값의 출처는 프로파일마다 다르다. legacy 는 하드웨어 사양이 아니라
 # 시뮬레이션 튜닝값이므로 전부 assumed 이고, pdf 는 사양표 그대로,

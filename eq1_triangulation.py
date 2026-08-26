@@ -51,39 +51,6 @@ def triangulate_point(u, v, alpha, beta, f, b, cx, cy):
     return X, Y, Z
 
 
-def triangulate_grid(pixel_points, alphas, betas, f, b, cx, cy):
-    """
-    N×M 격자점 전체 처리.
-    
-    Parameters
-    ----------
-    pixel_points : dict { (i,j): (u, v) }
-        격자 인덱스별 픽셀 좌표
-    alphas : list of float - i번째 행의 방사각 (rad)
-    betas : list of float - j번째 열의 방사각 (rad)
-    f, b, cx, cy : 카메라 파라미터
-    
-    Returns
-    -------
-    points_3d : ndarray (N, 3)
-        3D 점군 (X, Y, Z)
-    indices : list of (i, j)
-        성공한 점들의 인덱스
-    """
-    points_3d = []
-    indices = []
-    
-    for (i, j), (u, v) in pixel_points.items():
-        try:
-            X, Y, Z = triangulate_point(u, v, alphas[i], betas[j], f, b, cx, cy)
-            points_3d.append([X, Y, Z])
-            indices.append((i, j))
-        except ValueError:
-            continue
-    
-    return np.array(points_3d), indices
-
-
 # ============ 자체 검증 (PDF 정합성) ============
 if __name__ == "__main__":
     # PDF 검증 조건

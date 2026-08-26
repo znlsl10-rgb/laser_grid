@@ -103,7 +103,11 @@ def _defects_in_image(fd, camera_params):
             "bbox_px": [round(float(up.min()), 1), round(float(vp.min()), 1),
                         round(float(up.max()), 1), round(float(vp.max()), 1)],
             "depth_mm": round(float(c["depth_mm"]), 2),
-            "extent_mm": round(float(c["extent_mm"]), 1),
+            # 폭은 이 덩어리의 3D 점에서 직접 잰다. 클러스터가 들고 온
+            # 값은 면내 좌표계 기준이라 덩어리마다 같은 수가 나오곤 했다
+            # (실측: 요철 둘 다 3004.9mm — 부재 전체 크기였다).
+            "extent_mm": round(float(max(np.ptp(P[:, 0]), np.ptp(P[:, 1]))
+                                     * 1000.0), 1),
             "n_points": int(c["n_points"]),
             "z_m": round(float(np.median(Z)), 3),
             # 3D 산점도가 요철 위치를 찍으려면 조사기 좌표가 필요하다.

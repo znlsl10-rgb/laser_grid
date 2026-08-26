@@ -285,18 +285,25 @@ def defects_from_result(result, g_hat=None, frame="gravity"):
     안 보이므로 따로 표시한다 — PIL 판 그림이 하던 일을 이어받는다.
     """
     R, _, _ = _frame_matrix(g_hat, frame)
-    P, mm = [], []
+    P, mm, skipped = [], [], 0
     for r in result.get("regions", []):
-        for d in ((r.get("flatness") or {}).get("defects") or []):
+        fl = r.get("flatness") or {}
+        # 평활도를 못 잰 영역의 '요철' 은 잡음이다. 32.1mm 짜리 붉은 원을
+        # 그려 놓으면 근거 없는 결함을 그림이 주장하는 꼴이 된다 —
+        # 실측에서 그 덩어리는 벽 전체(3004.9mm)였다.
+        if fl.get("judgement") in ("측정불가", None) and fl.get("defects"):
+            skipped += len(fl["defects"])
+            continue
+        for d in (fl.get("defects") or []):
             c = d.get("center_xyz")
             if c is None:
                 continue
             P.append(np.asarray(c, float))
             mm.append(float(d.get("depth_mm", 0.0)))
     if not P:
-        return np.empty((0, 3)), np.empty(0)
+        return np.empty((0, 3)), np.empty(0), skipped
     A = np.vstack(P)
-    return (A @ R if R is not None else A), np.asarray(mm, float)
+    return ((A @ R if R is not None else A), np.asarray(mm, float), skipped)
 
 
 def groups_from_csv(path, by="member", frame="gravity", stride=1,
@@ -417,9 +424,9 @@ def draw(groups, path=None, title=None, g_hat=None, frame="gravity",
         raise ValueError("그릴 점이 없다")
     ALL = np.vstack([g["xyz"] for g in groups])
 
-    D = np.empty((0, 3)); Dmm = np.empty(0)
+    D = np.empty((0, 3)); Dmm = np.empty(0); Dskip = 0
     if defects is not None:
-        D, Dmm = defects
+        D, Dmm, Dskip = defects
         D = np.asarray(D, float).reshape(-1, 3)
 
     def _scatter3d(ax):
@@ -456,7 +463,9 @@ def draw(groups, path=None, title=None, g_hat=None, frame="gravity",
             h.append(Line2D([], [], marker="o", linestyle="none",
                             markerfacecolor="none", markeredgecolor="crimson",
                             markeredgewidth=1.4, markersize=3))
-            l.append(f"요철 {len(D)}곳" if ko else f"Defects ({len(D)})")
+            l.append((f"요철 {len(D)}곳" if ko else f"Defects ({len(D)})")
+                     + (f" (평활도 측정불가 {Dskip}곳 제외)"
+                        if ko and Dskip else ""))
         ax.legend(h, l, loc="upper right", fontsize=8, markerscale=4)
     else:
         fig = plt.figure(figsize=figsize or (15, 12))
@@ -509,8 +518,10 @@ def draw(groups, path=None, title=None, g_hat=None, frame="gravity",
                                   markerfacecolor="none",
                                   markeredgecolor="crimson",
                                   markeredgewidth=1.4, markersize=3))
-            labels.append(f"요철 {len(D)}곳" if ko
-                          else f"Defects ({len(D)})")
+            labels.append((f"요철 {len(D)}곳" if ko
+                           else f"Defects ({len(D)})")
+                          + (f" (평활도 측정불가 {Dskip}곳 제외)"
+                             if ko and Dskip else ""))
         fig.legend(handles, labels, loc="lower center",
                    ncol=min(4, max(1, len(labels))), fontsize=9,
                    markerscale=4, frameon=False,

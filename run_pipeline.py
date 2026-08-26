@@ -278,24 +278,6 @@ def _median_depth_of(lines_xyz):
     return float(np.median(Z))
 
 
-def _line_planes_from_truth(truth, cp):
-    """
-    정답 데이터가 있으면 레이저 평면을 **데이터에서** 맞춘다.
-
-    발사각 하나로 평면을 세우면 "V평면은 Y축을 품는다" 같은 가정이 따라
-    들어온다. 정답 점은 정의상 그 평면 위에 있으므로 평면을 직접 맞추면
-    가정 없이 법선이 나온다 (실측 잔차 0.0006~0.33mm).
-
-    xyz_world 가 없으면 화소만으로는 평면을 세울 수 없으므로 None.
-    """
-    if not truth:
-        return None
-    first = next(iter(truth.values()))
-    if not first.get("points") or "xyz_world" not in first["points"][0]:
-        return None
-    return None          # 자세를 모르면 세계좌표를 조사기좌표로 못 옮긴다
-
-
 # ---------------------------------------------------------------------
 # 사양 확인용 격자 읽기 — 예측 없이 이미지만 본다
 # ---------------------------------------------------------------------

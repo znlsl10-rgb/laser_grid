@@ -987,8 +987,10 @@ def region_xyz_rows(result, g_hat=None, stride=1):
         lid = r.get("point_lid")
         Pw = P @ R if R is not None else None
         for j in range(0, len(P), max(1, int(stride))):
-            row = {"부재번호": i + 1, "클래스": r.get("class"),
-                   "판정대상": r.get("kind"), "구분": "측정",
+            row = {"부재번호": i + 1,
+                   "클래스": CLASS_KO.get(r.get("class"), r.get("class")),
+                   "판정대상": KIND_KO.get(r.get("kind"), r.get("kind")),
+                   "구분": "측정",
                    "선ID": (str(lid[j]) if lid is not None and j < len(lid)
                             else None),
                    "X_m": round(float(P[j, 0]), 5),
@@ -1009,8 +1011,10 @@ def region_xyz_rows(result, g_hat=None, stride=1):
         A = np.asarray(A, float)
         Aw = A @ R if R is not None else None
         for j in range(0, len(A), max(1, int(stride))):
-            row = {"부재번호": i + 1, "클래스": r.get("class"),
-                   "판정대상": r.get("kind"), "구분": "가로선(면에 투영)",
+            row = {"부재번호": i + 1,
+                   "클래스": CLASS_KO.get(r.get("class"), r.get("class")),
+                   "판정대상": KIND_KO.get(r.get("kind"), r.get("kind")),
+                   "구분": "가로선(유도값)",
                    "선ID": None,
                    "X_m": round(float(A[j, 0]), 5),
                    "Y_m": round(float(A[j, 1]), 5),
@@ -1040,8 +1044,11 @@ def region_xyz_summary(result, g_hat=None):
                 fams[str(l)[0]] = fams.get(str(l)[0], 0) + int(
                     np.sum(np.asarray(lid, dtype=object) == l))
         rec = {
-            "부재번호": i + 1, "클래스": r.get("class"),
-            "검측": r.get("kind"), "상태": r.get("status"),
+            "부재번호": i + 1,
+            "클래스": CLASS_KO.get(r.get("class"), r.get("class")),
+            "검측": KIND_KO.get(r.get("kind"), r.get("kind")),
+            "상태": {"measured": "검측함",
+                   "rejected": "기각"}.get(r.get("status"), r.get("status")),
             "점수": int(len(P)),
             "가로선점수": int(len(r["aux_point_xyz"])
                        if r.get("aux_point_xyz") is not None else 0),

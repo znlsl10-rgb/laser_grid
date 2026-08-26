@@ -217,11 +217,6 @@ def deviation_mm(theta_deg, member_length_m):
     return float(abs(member_length_m) * np.tan(np.radians(abs(theta_deg))) * 1000.0)
 
 
-def judge_pass_fail(theta_deg, tolerance_deg=0.5):
-    """각도 기준 단순 판정 (v1 호환)."""
-    return bool(abs(theta_deg) <= tolerance_deg)
-
-
 def judge_kcs(theta_deg, member_class, member_length_m=None,
               measured_span_m=None):
     """

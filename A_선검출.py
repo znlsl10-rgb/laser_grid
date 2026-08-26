@@ -1282,36 +1282,6 @@ def _steger_subpixel(idx, weights, pred, band):
     return 0.75 * mu + 0.25 * centroid
 
 
-def _gaussian_subpixel(idx, weights, pred, band):
-    fb = _weighted_subpixel_peak(idx, weights)
-    if not _SCIPY or len(idx) < 5:
-        return fb
-
-    w_sum    = weights.sum()
-    centroid = float(np.dot(idx, weights) / (w_sum + 1e-9))
-    peak_i   = int(np.argmax(weights))
-    A0       = float(weights[peak_i])
-    sigma0   = max(1.2, float(
-        np.sqrt(np.sum(weights * (idx - centroid)**2) / (w_sum + 1e-9))))
-    C0       = float(np.percentile(weights, 10))
-
-    try:
-        popt, _ = _curve_fit(
-            _gauss1d, idx, weights,
-            p0=[A0, centroid, sigma0, C0],
-            bounds=([0, idx[0], 0.5, 0], [A0*2.5, idx[-1], band, A0*0.5]),
-            maxfev=300)
-        mu_fit    = float(popt[1])
-        sigma_fit = float(popt[2])
-        if abs(mu_fit - pred) > band * 0.6:
-            return fb
-        if sigma_fit < 0.5 or sigma_fit > band * 0.8:
-            return fb
-        return 0.7 * mu_fit + 0.3 * centroid
-    except Exception:
-        return fb
-
-
 def _gauss1d(x, A, mu, sigma, C):
     return A * np.exp(-0.5 * ((x - mu) / (sigma + 1e-9))**2) + C
 

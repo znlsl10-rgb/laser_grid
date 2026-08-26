@@ -255,22 +255,6 @@ def load_folder(path, world_up=(0.0, 0.0, 1.0), stride=1,
 # =====================================================================
 # 선검출 정확도 — 화소 단계가 맞아야 3D 가 맞는다
 # =====================================================================
-def _flip_about_principal(im, cx, cy, resample=None):
-    """
-    주점 (cx, cy) 를 중심으로 이미지를 180° 돌린다.
-
-    PIL 의 ROTATE_180 은 u → (w−1) − u 로 **이미지 중심** 기준이다.
-    화소 좌표는 주점 기준으로 2·c − u 로 되돌리므로, 주점이 이미지
-    중심과 다르면 그만큼 어긋난다. 이 표본에서는 폭 1269, 주점 634.5 라
-    정확히 1px 차이가 났고, 그것이 벽체 캡처의 u 오차 중앙값 −0.96px 로
-    그대로 나타났다. 센서 환산 1px 은 1.5m 에서 깊이 10mm 다.
-    """
-    from PIL import Image
-    if resample is None:
-        resample = Image.BICUBIC
-    # AFFINE 은 출력(x,y) → 입력(ax+by+c, dx+ey+f) 로 역방향 사상이다.
-    return im.transform(im.size, Image.AFFINE,
-                        (-1, 0, 2.0 * cx, 0, -1, 2.0 * cy), resample=resample)
 
 
 def evaluate_line_detection(path, cap, image_name="CAST.png",
@@ -1306,14 +1290,6 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
     return {"result": res, "capture": cap, "seg": seg, "xlsx": xl,
             "pointcloud": pc3d, "pointcloud_csv": pc_csv,
             "name": name, "out_dir": out_dir}
-
-
-def _truth_depth(cap, lines_xyz):
-    """raycast xyz_world 를 조사기 좌표 Z 로 바꿔 복원 깊이와 비교."""
-    rt = cap["raw"].get("rig_transform") or {}
-    if "laser_pos_world" not in rt:
-        return None
-    return None      # 자세 부호 규약이 캡처마다 달라 여기서는 생략
 
 
 def main():

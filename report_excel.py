@@ -169,6 +169,85 @@ def _embed_image(ws, path, row, max_px=1400, col="A", caption=None,
         return row + 1
 
 
+def _sheet_howto(wb, openpyxl, result):
+    """
+    맨 앞에 붙는 안내 — "이 조서를 어떻게 읽나".
+
+    시트 11장을 처음 여는 사람은 어디부터 봐야 할지 모른다. 판정 낱말도
+    네 가지인데 그중 둘(측정불가·판정보류)은 "불합격" 이 아니라 "이 조건
+    에서는 판정 못 함" 이라는 뜻이라, 그 구분을 모르면 조서를 거꾸로
+    읽는다. 그래서 표 앞에 한 장을 둔다.
+    """
+    from openpyxl.styles import Font, Alignment
+    ws = wb.create_sheet("0.읽는 법", 0)
+    bold = Font(bold=True)
+    head = Font(bold=True, size=13)
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    rows = [
+        ("H", "먼저 볼 것", ""),
+        ("", "6.검측결과", "부재별 판정이 한 줄씩. 이 조서의 결론이다."),
+        ("", "11.유의사항", "그 판정을 어디까지 믿을 수 있는지. "
+                          "판정보류·측정불가가 있으면 여기에 이유가 있다."),
+        ("", "5.세그멘테이션(3단계)", "색이 어느 부재를 뜻하는지. 그림과 "
+                                "짝지어 본다."),
+        ("", "", ""),
+        ("H", "판정 낱말 네 가지", ""),
+        ("", "합격", "허용치 안이고, 그렇게 말할 근거도 갖췄다."),
+        ("", "기준초과", "허용치를 넘었다. 조치가 필요하다."),
+        ("", "측정불가", "**불합격이 아니다.** 이 촬영 조건에서 그 항목을 "
+                      "잴 만한 분해능이 안 나온다는 뜻이다. 거리를 줄이거나 "
+                      "격자를 조밀하게 해서 다시 찍어야 한다."),
+        ("", "판정보류", "**불합격이 아니다.** 값은 나왔지만 그 값만으로 "
+                      "합격이라 말할 수 없다는 뜻이다. 괄호 안에 이유가 "
+                      "붙는다 — 단면 미분해 / 노출길이 / 근거 가정."),
+        ("", "", ""),
+        ("H", "시트 차례", ""),
+        ("", "1.요약", "입력·가정·결과 한눈에"),
+        ("", "2.설계값", "쓴 사양과 그 출처 등급(spec / assumed)"),
+        ("", "3.선검출(1단계)", "선을 몇 개 찾았고 얼마나 정확한가 + 대조 그림"),
+        ("", "4.깊이검증(2단계)", "화소를 3D 로 되돌린 정확도. 정답값이 있으면 "
+                             "mm 오차표"),
+        ("", "5.세그멘테이션(3단계)", "색 ↔ 부재 대응 + 그림"),
+        ("", "6.검측결과", "부재별 수직도·수평도·평활도 판정"),
+        ("", "7.평활도상세", "직선자 처짐의 근거"),
+        ("", "8.요철위치", "튀어나온·꺼진 자리의 위치와 깊이 + 그림"),
+        ("", "9.3D좌표(부재별)", "부재별 점 수·중심·크기 + 3D 점군 그림"),
+        ("", "10.3D좌표(점목록)", "점 하나하나의 좌표 (부재 구분 포함)"),
+        ("", "11.유의사항", "이 값을 어디까지 믿을 수 있는가"),
+        ("", "", ""),
+        ("H", "자주 오해하는 것", ""),
+        ("", "'측정 구간' 은 부재 길이가 아니다",
+         "격자는 고정 화각을 덮으므로 덮는 미터 길이가 **거리에 비례**한다. "
+         "같은 규격 동바리도 거리가 다르면 구간이 다르게 나온다. 9번 시트의 "
+         "`길이 확정?` 칸이 '하한' 이면 부재는 그 값보다 길다는 뜻이고, 값 "
+         "앞에 ≥ 가 붙는다."),
+        ("", "'가로선 점' 은 측정값이 아니다",
+         "격자를 굴리지 않으면 가로선은 깊이를 못 준다(레이저 평면이 카메라 "
+         "광심을 지난다). 그 점들은 위치만 맞고 거리는 유도한 값이라 검측에 "
+         "넣지 않았다. 9번 시트 `가로선점 배치면` 칸에 어디에 올렸는지 "
+         "적힌다."),
+        ("", "각도 판정과 mm 판정",
+         "부재 전체 길이를 알아야 KCS 의 ±20mm(부재 전체 기준) 판정이 "
+         "성립한다. 길이를 모르면 각도(±0.5°)로 판정하고, mm 는 참고값으로만 "
+         "병기한다."),
+    ]
+    r = 1
+    for kind, a, b in rows:
+        if kind == "H":
+            ws.cell(row=r, column=1, value=a).font = head
+        else:
+            ws.cell(row=r, column=1, value=a).font = bold
+            c = ws.cell(row=r, column=2, value=b)
+            c.alignment = wrap
+        r += 1
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 96
+    for i in range(1, r):
+        ws.row_dimensions[i].height = None
+    return ws
+
+
 def _sheet_summary(wb, openpyxl, record, meta, result):
     ws = wb.active
     ws.title = "1.요약"
@@ -642,7 +721,8 @@ def _sheet_flatness(wb, openpyxl, result):
                        c.get("max_gap_mm"), c.get("upper_estimate_mm"),
                        c.get("tolerance_mm"),
                        (f"{ratio*100:.0f}%" if ratio is not None else ""),
-                       kcs.get("judgement"), kcs.get("note") or ""])
+                       kcs.get("judgement"), kcs.get("note") or "",
+                       f.get("judgement") or "—"])
             cc = ws.cell(row=ws.max_row, column=9)
             cf = _verdict_fill(openpyxl, cc.value)
             if cf:
@@ -658,9 +738,9 @@ def _sheet_flatness(wb, openpyxl, result):
 def _sheet_defects(wb, openpyxl, result, seg_image_path=None):
     """검출된 요철이 화면 어디에 있는가."""
     ws = wb.create_sheet("8.요철위치")
-    ws.append(["No", "부재", "요철", "깊이(mm)", "크기(mm)",
+    ws.append(["No", "부재", "요철", "깊이(mm)", "요철 폭(mm)",
                "화면 중심 u,v (px)", "화면 범위 u1,v1–u2,v2 (px)",
-               "측정거리(m)", "구성 점수"])
+               "측정거리(m)", "구성 점수", "그 부재 평활도 판정"])
     n = 0
     for i, r in enumerate(result.get("regions", [])):
         f = r.get("flatness") or {}
@@ -671,10 +751,14 @@ def _sheet_defects(wb, openpyxl, result, seg_image_path=None):
                        k + 1, dd["depth_mm"], dd["extent_mm"],
                        f"{dd['center_px'][0]:.0f}, {dd['center_px'][1]:.0f}",
                        f"{x0:.0f}, {y0:.0f} – {x1:.0f}, {y1:.0f}",
-                       dd["z_m"], dd["n_points"]])
+                       dd["z_m"], dd["n_points"],
+                       # 그 부재의 평활도를 아예 못 쟀다면 이 '요철' 은
+                       # 잡음이다. 같은 표에 그 사실을 붙여 둔다 —
+                       # 실측에서 벽 전체(3004.9mm)가 요철로 잡혔다.
+                       f.get("judgement") or "판정 없음"])
     if n == 0:
-        ws.append(["", "검출된 요철 없음", "", "", "", "", "", "", ""])
-    _style(ws, openpyxl, widths=[5, 11, 6, 11, 11, 20, 26, 11, 10])
+        ws.append(["", "검출된 요철 없음", "", "", "", "", "", "", "", ""])
+    _style(ws, openpyxl, widths=[5, 11, 6, 11, 11, 20, 26, 11, 10, 14])
     ws.append([])
     ws.append(["읽는 법", "화면 좌표는 센서 화소 기준이며, 세그멘테이션 "
                "이미지에 자홍색 원으로 같은 위치가 표시된다. 깊이는 평활값이 "
@@ -852,6 +936,7 @@ def save_excel(path, result, meta=None, label_pixels=None,
     record = REPORT.build_record(result, meta)
     wb = openpyxl.Workbook()
     _sheet_summary(wb, openpyxl, record, dict(meta or {}), result)
+    _sheet_howto(wb, openpyxl, result)
     _sheet_design(wb, openpyxl)
     _sheet_detection(wb, openpyxl, detection, end_to_end, triangulation,
                      overlay_image=detection_image)
@@ -876,6 +961,7 @@ def save_excel(path, result, meta=None, label_pixels=None,
              "5.세그멘테이션(3단계)", "6.검측결과", "7.평활도상세",
              "8.요철위치", "9.3D좌표(부재별)", "10.3D좌표(점목록)",
              "11.유의사항"]
+    order = ["0.읽는 법"] + order
     have = [t for t in order if t in wb.sheetnames]
     wb._sheets = ([wb[t] for t in have]
                   + [w for w in wb.worksheets if w.title not in have])
@@ -883,4 +969,8 @@ def save_excel(path, result, meta=None, label_pixels=None,
     if d:
         _os.makedirs(d, exist_ok=True)
     wb.save(path)
+    # 그림을 붙이려고 만든 임시 PNG 는 저장이 끝나야 지울 수 있다
+    # (openpyxl 이 save 시점까지 파일을 연다). 안 지우면 실행할
+    # 때마다 /tmp 에 수 MB 씩 쌓인다.
+    _cleanup_embed_tmp()
     return path
