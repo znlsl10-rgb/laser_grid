@@ -34,6 +34,7 @@ CALIB = _load("calibration")
 DET = _load("A_선검출")
 EQ7 = _load("eq7_laser_plane")
 REPORT = _load("report")
+RP = _load("run_pipeline")
 # synth_scene 은 자기 인스턴스의 calibration 을 본다. _load 는 호출마다
 # 새 모듈을 만들므로, 위의 CALIB 에 use_profile 을 걸어도 합성 씬은 옛
 # 프로파일로 남는다. 씬을 만드는 검증은 이쪽을 써야 한다.
@@ -710,6 +711,67 @@ def test_rolled_grid_detection():
         CALIB.use_profile(keep)
 
 
+def test_run_pipeline_inputs():
+    """[13] 단일 입구 — IMU·거리·규약 복원"""
+    print("\n[13] run_pipeline 입력 처리")
+
+    # IMU 해석 — 부호가 뒤집히면 수직/수평 판정 자체가 뒤집힌다
+    g, src, assumed = RP.gravity_from_imu(None)
+    check(f"IMU 없음 → 똑바로 섰다고 가정 ĝ={g.tolist()}",
+          assumed and np.allclose(g, [0, 1, 0]))
+    g, _, _ = RP.gravity_from_imu({"pitch_deg": 34.0})
+    want = np.array([0.0, np.cos(np.radians(34)), np.sin(np.radians(34))])
+    check(f"하향 34° → ĝ={np.round(g, 4).tolist()}",
+          np.allclose(g, want, atol=1e-9))
+    g, _, _ = RP.gravity_from_imu({"gravity": [0, 2, 0]})
+    check("중력벡터는 정규화된다", np.allclose(g, [0, 1, 0]))
+    g, _, _ = RP.gravity_from_imu({"accel": [0, -1, 0]})
+    check("가속도계는 부호를 뒤집는다 (비력의 반대)",
+          np.allclose(g, [0, 1, 0]))
+
+    # 양자화 하한 — 이진 이미지에서 하한이 잡히는가
+    binary = np.zeros((80, 80, 3), np.uint8)
+    binary[:, 30:32, 1] = 255
+    qz = RP.quantization_floor(binary)
+    check(f"이진 이미지 → σ 하한 {qz.get('sigma_floor_px')}px",
+          qz["binary"] and abs(qz["sigma_floor_px"] - 1 / np.sqrt(12)) < 1e-3)
+    ramp = np.zeros((80, 80, 3), np.uint8)
+    for k, v in enumerate((60, 160, 255, 160, 60)):
+        ramp[:, 28 + k, 1] = v
+    check("밝기 기울기가 있으면 하한을 걸지 않는다",
+          not RP.quantization_floor(ramp)["binary"])
+
+    # 격자에서 거리·화소 규약 복원 — 정답을 알고 있는 합성 격자로
+    keep = CALIB.ACTIVE_PROFILE
+    try:
+        CALIB.use_profile("legacy")
+        cp = dict(CALIB.CAMERA_PARAMS)
+        W, H = cp["resolution"]
+        cp.update({"image_w": W, "image_h": H, "n_v": CALIB.N_VERTICAL,
+                   "n_h": CALIB.N_HORIZONTAL, "fov_h_deg": CALIB.FOV_DEG,
+                   "fov_v_deg": CALIB.FOV_DEG, "laser_tilt_deg": 0.0,
+                   "laser_roll_deg": 0.0})
+        la = CALIB.make_line_angles()
+        f, b = cp["f_px"], cp["b_m"]
+        cx, cy = cp["cx_px"], cp["cy_px"]
+        for z_true, flip in ((1.55, False), (1.55, True), (2.70, False)):
+            img = np.zeros((H, W, 3), np.uint8)
+            for i in range(CALIB.N_VERTICAL):
+                u = f * np.tan(la[f"V{i}"]["angle_rad"]) - f * b / z_true + cx
+                if flip:
+                    u = 2 * cx - u
+                k = int(round(u))
+                if 1 <= k < W - 1:
+                    img[:, k:k + 2, 1] = 255
+            pose = RP.estimate_grid_pose(img, cp, la)
+            ok = (pose.get("ok") and pose["flipped"] == flip
+                  and abs(pose["z_est_m"] - z_true) < 0.02)
+            check(f"격자에서 복원: 참 {z_true}m/뒤집힘 {flip} → "
+                  f"{pose.get('z_est_m')}m/{pose.get('flipped')}", ok)
+    finally:
+        CALIB.use_profile(keep)
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -719,7 +781,8 @@ def main():
               test_axis_fit, test_region_pipeline,
               test_segmentation_robustness, test_boundary_rejection,
               test_eq7_laser_plane, test_h_lines_in_pipeline,
-              test_pointcloud_export, test_rolled_grid_detection):
+              test_pointcloud_export, test_rolled_grid_detection,
+              test_run_pipeline_inputs):
         t()
     print("\n" + "=" * 70)
     if _FAILS:

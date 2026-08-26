@@ -96,18 +96,24 @@ def fit_camera_rotation(P_world, uv, cam_pos, f, cx, cy):
 # =====================================================================
 # 폴더 읽기
 # =====================================================================
-def load_folder(path, world_up=(0.0, 0.0, 1.0), stride=1):
+def load_folder(path, world_up=(0.0, 0.0, 1.0), stride=1,
+                params_path=None, truth_path=None):
     """
     내보내기 폴더 하나를 검측 입력 묶음으로 바꾼다.
+
+    params_path·truth_path 를 주면 폴더 규약 대신 그 파일을 쓴다. 코랩처럼
+    파일을 하나씩 올리는 곳에서 폴더 구조를 강요하지 않기 위해서다.
 
     Returns
     -------
     dict — lines_pixels, line_angles, camera_params, g_hat, diag, meta
     """
-    cp_raw = json.load(open(os.path.join(path, "camera_params.json"),
-                            encoding="utf-8"))
-    cast = json.load(open(os.path.join(path, "cast_pixels.json"),
-                          encoding="utf-8"))
+    cp_raw = json.load(open(
+        params_path or os.path.join(path, "camera_params.json"),
+        encoding="utf-8"))
+    cast = json.load(open(
+        truth_path or os.path.join(path, "cast_pixels.json"),
+        encoding="utf-8"))
 
     SW, SH = cp_raw["sensor_size"]
     sw, sh = cp_raw.get("screenshot_size", [SW, SH])
@@ -265,7 +271,8 @@ def _flip_about_principal(im, cx, cy, resample=None):
                         (-1, 0, 2.0 * cx, 0, -1, 2.0 * cy), resample=resample)
 
 
-def evaluate_line_detection(path, cap, image_name="CAST.png"):
+def evaluate_line_detection(path, cap, image_name="CAST.png",
+                            image_path=None):
     """
     렌더 이미지에 A_선검출 을 돌려 raycast 정답 화소와 대조한다.
 
@@ -295,7 +302,7 @@ def evaluate_line_detection(path, cap, image_name="CAST.png"):
     """
     cast = cap["cast"]
     cp_raw = cap["raw"]
-    fp = os.path.join(path, image_name)
+    fp = image_path or os.path.join(path, image_name)
     if not os.path.exists(fp):
         return None
     try:
@@ -495,7 +502,8 @@ def evaluate_line_detection(path, cap, image_name="CAST.png"):
     to_mm = (lambda px: z_ref ** 2 / (f_sensor * b) * (px * su) * 1000.0)
     dz_mm = to_mm(float(np.sqrt(np.mean(E ** 2)))) if len(E) else None
     return {
-        "image": image_name, "image_size": [w, h], "flipped": flipped,
+        "image": os.path.basename(fp), "image_size": [w, h],
+        "flipped": flipped,
         "scale_to_sensor": round(su, 4), "scale_to_sensor_v": round(sv, 4),
         "_detected": {k: np.asarray(v, float) for k, v in det.items()},
         "f_px_image": round(f_img, 1), "f_px_sensor": f_sensor,
@@ -726,7 +734,8 @@ def _depth_diff_mm(det_uv, gt_uv, lid, cap, cp_raw, su, flipped):
             round(float(np.percentile(np.abs(dz), 95)), 3))
 
 
-def save_detection_overlay(path, cap, det, out_png, zoom=6, crop=140):
+def save_detection_overlay(path, cap, det, out_png, zoom=6, crop=140,
+                           image_path=None):
     """
     선검출이 실제 레이저 위에 얹혔는지 눈으로 확인하는 그림.
 
@@ -744,7 +753,7 @@ def save_detection_overlay(path, cap, det, out_png, zoom=6, crop=140):
         from PIL import Image, ImageDraw
     except ImportError:
         return None
-    fp = os.path.join(path, det.get("image", "CAST.png"))
+    fp = image_path or os.path.join(path, det.get("image", "CAST.png"))
     if not os.path.exists(fp):
         return None
     im = Image.open(fp).convert("RGB")
