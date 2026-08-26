@@ -206,11 +206,16 @@ def inspect(path, off_path, standoff_m, pitch_deg, backend, out_dir=None,
         print("[중단] 검출된 선이 없다. --check 로 사양을 먼저 맞춘다.")
         return 2
 
-    lines_xyz, lines_uv, skipped = PIPE.triangulate_lines(
+    lines_xyz, lines_uv, tri_info = PIPE.triangulate_lines(
         detected, line_angles, cp)
     n3d = sum(len(v) for v in lines_xyz.values())
-    print(f"삼각측량: V선 {len(lines_xyz)}개 / {n3d}점 "
-          f"(H선 {len(skipped)}개는 α 를 모르므로 제외)")
+    nf = tri_info["n_by_family"]
+    print(f"삼각측량: 선 {len(lines_xyz)}개 / {n3d}점 "
+          f"(V {nf.get('V', 0)}점 + H {nf.get('H', 0)}점)")
+    for lid, why in tri_info["skipped"][:3]:
+        print(f"  제외 {lid}: {why}")
+    if len(tri_info["skipped"]) > 3:
+        print(f"  ... 그 밖에 {len(tri_info['skipped'])-3}개 선 제외")
     if n3d == 0:
         print("[중단] 삼각측량된 점이 없다.")
         return 2

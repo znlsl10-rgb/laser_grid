@@ -45,6 +45,7 @@ def _load(name):
 
 
 _EQ1 = _load("eq1_triangulation")
+_EQ7 = _load("eq7_laser_plane")
 
 # ── 정답값 (Isaac 씬의 HORIZ=0.3, VBACK=0.5 규약을 그대로 따름) ──
 GT_WALL_TILT_DEG = 0.5      # 벽이 연직에서 벗어난 각
@@ -75,7 +76,14 @@ GT_BUMP_SIGMA_M = 0.05
 #
 # 이전 문서가 "평활도를 정답의 60~70% 로 과소보고" 라고 적은 것은
 # 6.0mm(융기 높이)와 비교한 탓이며, 실제로는 참값을 맞히고 있었다.
-GT_STRAIGHTEDGE_MM = {"legacy": 2.60, "pdf": 4.54, "improved": 4.01}
+#   diagonal 화각 42.61° → 프로파일 1.15m (improved 와 같은 하드웨어)
+#
+# diagonal 은 improved 와 하드웨어가 같은데 참값이 4.01 → 4.07 로 달라진다.
+# 격자를 45° 굴리면 벽에서 점이 놓이는 자리가 달라져 직선자가 걸치는
+# 반폭 D 가 조금 넓어지기 때문이다. 위 gap(d) 식이 D 에 의존하므로
+# 참값도 따라 움직인다 — 알고리즘 오차가 아니라 기하가 바뀐 것이다.
+GT_STRAIGHTEDGE_MM = {"legacy": 2.60, "pdf": 4.54, "improved": 4.01,
+                      "diagonal": 4.07}
 
 
 def straightedge_truth_mm(profile=None):
@@ -115,6 +123,7 @@ WITH_REBAR = False
 _CALIB = _load("calibration")
 CAMERA_PARAMS = dict(_CALIB.CAMERA_PARAMS)
 GRID = {"n_vertical": _CALIB.N_VERTICAL,
+        "n_horizontal": _CALIB.N_HORIZONTAL,
         "fov_deg": _CALIB.GRID_PARAMS["fov_deg"],
         "samples_per_line": _CALIB.GRID_PARAMS["samples_per_line"]}
 SIGMA_U_PX = _CALIB.SIGMA_U_PX
@@ -281,9 +290,10 @@ def build_scene(seed=2026, sigma_u_px=SIGMA_U_PX, label_map_stride=2,
     cx = CAMERA_PARAMS["cx_px"]; cy = CAMERA_PARAMS["cy_px"]
     W, H = CAMERA_PARAMS["resolution"]
 
-    # ── 레이저 V선 투사 ──
+    # ── 레이저 선 투사 ──
     # 발사각은 calibration 단일 출처 (레이저 수렴각이 α 에 포함된다)
-    _ang = _CALIB.make_line_angles(GRID["n_vertical"], GRID["n_vertical"],
+    roll_deg = float(_CALIB.GRID_PARAMS.get("laser_roll_deg", 0.0) or 0.0)
+    _ang = _CALIB.make_line_angles(GRID["n_vertical"], GRID["n_horizontal"],
                                    GRID["fov_deg"],
                                    _CALIB.GRID_PARAMS["laser_tilt_deg"])
     alphas = np.array([_ang[f"V{i}"]["angle_rad"]
@@ -291,10 +301,33 @@ def build_scene(seed=2026, sigma_u_px=SIGMA_U_PX, label_map_stride=2,
     fov = np.radians(GRID["fov_deg"])
     betas = np.linspace(-fov / 2, fov / 2, GRID["samples_per_line"])
 
+    # 격자를 굴리지 않은 사양에서는 H선이 깊이를 못 주므로(eq7 이득 g=∞)
+    # 예전처럼 V선만 쏜다. 굴린 사양에서는 두 계열 모두 깊이를 주므로
+    # 둘 다 쏜다. 이 분기를 두는 이유는 성능이 아니라 **재현성** 이다 —
+    # 굴리지 않은 프로파일의 광선 생성 경로를 건드리면 이미 검증해 둔
+    # 합성 씬 정답값(GT_STRAIGHTEDGE_MM 등)이 미세하게 달라진다.
+    emit = [(f"V{i}", "alpha", float(a)) for i, a in enumerate(alphas)]
+    if roll_deg:
+        emit += [(f"H{j}", "beta", float(_ang[f"H{j}"]["angle_rad"]))
+                 for j in range(GRID["n_horizontal"])]
+
     lines_pixels, lines_xyz, point_class = {}, {}, {}
-    for i, al in enumerate(alphas):
-        dirs = np.stack([np.full_like(betas, np.tan(al)), np.tan(betas),
-                         np.ones_like(betas)], axis=1)
+    line_angles = {}
+    for lid, fixed, al in emit:
+        n_plane = np.asarray(_ang[lid]["normal"], float)
+        if roll_deg:
+            # 평면 위에서 광선을 훑는다. 평면 안에서 +Z 에 가장 가까운
+            # 방향을 중심축 a 로 잡고, 그와 직교하는 평면 내 방향 c 로
+            # 부채꼴을 편다. 굴림·수렴각이 어떻게 들어와도 같은 코드가 받는다.
+            a_ax = np.array([0.0, 0.0, 1.0]) - n_plane * float(n_plane[2])
+            a_ax /= np.linalg.norm(a_ax)
+            c_ax = np.cross(n_plane, a_ax)
+            c_ax /= np.linalg.norm(c_ax)
+            dirs = (np.cos(betas)[:, None] * a_ax
+                    + np.sin(betas)[:, None] * c_ax)
+        else:
+            dirs = np.stack([np.full_like(betas, np.tan(al)), np.tan(betas),
+                             np.ones_like(betas)], axis=1)
         dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
         t, cid = _intersect(dirs, geo)
         hit = np.isfinite(t) & (cid > 0)
@@ -325,22 +358,19 @@ def build_scene(seed=2026, sigma_u_px=SIGMA_U_PX, label_map_stride=2,
             continue
         u, v, cls_hit = u[visible], v[visible], cls_hit[visible]
 
-        # eq1 로 역산 (실제 파이프라인과 동일 경로)
-        xyz = []
-        keep_u, keep_v, keep_c = [], [], []
-        for uu, vv, cc in zip(u, v, cls_hit):
-            try:
-                X, Y, Z = _EQ1.triangulate_point(uu, vv, al, 0.0, f, b, cx, cy)
-            except ValueError:
-                continue
-            xyz.append([X, Y, Z]); keep_u.append(uu); keep_v.append(vv)
-            keep_c.append(cc)
-        if len(xyz) < 5:
+        # eq7 평면식으로 역산 (실제 파이프라인과 동일 경로).
+        # 굴리지 않은 V선에서는 eq1 과 나노미터 아래까지 같은 값이다
+        # (eq7 자체 검증에서 2000점 대조 확인).
+        P3, keep = _EQ7.triangulate_plane(np.column_stack([u, v]), n_plane,
+                                          f, b, cx, cy)
+        if len(P3) < 5:
             continue
-        lid = f"V{i}"
-        lines_pixels[lid] = np.column_stack([keep_u, keep_v]).tolist()
-        lines_xyz[lid] = xyz
-        point_class[lid] = np.array(keep_c, dtype=np.int32)
+        lines_pixels[lid] = np.column_stack([u[keep], v[keep]]).tolist()
+        lines_xyz[lid] = P3.tolist()
+        point_class[lid] = np.asarray(cls_hit, dtype=np.int32)[keep]
+        line_angles[lid] = {"fixed": fixed, "angle_rad": al,
+                            "normal": n_plane.tolist(),
+                            "depth_gain": _EQ7.depth_gain(n_plane)}
 
     # ── 정답 라벨맵 (카메라 시점 레이캐스트) ──
     st = int(label_map_stride)
@@ -370,9 +400,6 @@ def build_scene(seed=2026, sigma_u_px=SIGMA_U_PX, label_map_stride=2,
     right_w = _unit(np.cross(view_w, np.array([0.0, 0.0, 1.0])))
     down_w = _unit(np.cross(view_w, right_w))
     R_world_cam = np.column_stack([right_w, down_w, view_w])
-
-    line_angles = {f"V{i}": {"fixed": "alpha", "angle_rad": float(a)}
-                   for i, a in enumerate(alphas)}
 
     return {"lines_pixels": lines_pixels, "lines_xyz": lines_xyz,
             "point_class": point_class,

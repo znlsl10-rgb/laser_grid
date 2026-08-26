@@ -40,6 +40,7 @@ def measure(profile, seeds=SEEDS):
     SYN.CAMERA_PARAMS.clear()
     SYN.CAMERA_PARAMS.update(CALIB.CAMERA_PARAMS)
     SYN.GRID.update({"n_vertical": CALIB.N_VERTICAL,
+                     "n_horizontal": CALIB.N_HORIZONTAL,
                      "fov_deg": CALIB.FOV_DEG, "samples_per_line": 250})
     su = CALIB.SIGMA_U_PX
     acc = {k: [] for k in ("wall", "floor", "shoring", "gap", "band", "dilate")}
@@ -77,17 +78,23 @@ ROWS = [("깊이 잡음 σ_Z @1.2m",       "mm", "sigma_z"),
 def main():
     keep = CALIB.ACTIVE_PROFILE
     a, b = measure("pdf"), measure("improved")
+    c = measure("diagonal")
     CALIB.use_profile(keep)
 
     print("=" * 74)
     print(f"사양 프로파일 정확도 비교  (합성 씬 {len(SEEDS)}회)")
     print("=" * 74)
-    print(f"{'항목':<26}{'단위':<5}{'PDF 원안':>13}{'개선안':>13}{'개선':>9}")
+    print(f"{'항목':<26}{'단위':<5}{'PDF 원안':>13}{'개선안':>13}"
+          f"{'대각격자':>13}{'개선':>9}")
     print("-" * 74)
     for name, unit, key in ROWS:
-        x, y = abs(a[key]), abs(b[key])
+        x, y, z = abs(a[key]), abs(b[key]), abs(c[key])
         g = (x / y) if y else float("inf")
-        print(f"{name:<26}{unit:<5}{x:>13.4f}{y:>13.4f}{g:>8.2f}배")
+        print(f"{name:<26}{unit:<5}{x:>13.4f}{y:>13.4f}{z:>13.4f}{g:>8.2f}배")
+    print("-" * 74)
+    print("대각격자 = 개선안 하드웨어 + DOE 를 광축 둘레로 45° 굴린 것.")
+    print("굴리면 가로선도 깊이를 준다 — 깊이 표본이 배로 늘고, 무엇보다")
+    print("가로 방향으로도 표본이 생겨 직선자 평활도를 실제로 잴 수 있다.")
     print()
     print("읽는 법")
     print("  · 벽 수직도는 개선되지 않는다. 두 사양 모두 0.013° 로 목표")

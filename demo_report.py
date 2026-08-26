@@ -74,13 +74,26 @@ def main(out_dir=None):
         f"V선이 한두 줄만 걸려 표본이 얕다. 사양 프로파일을 바꾸면 이 부재의 "
         f"측정 여부 자체가 달라진다.",
     ]
+    # 부재별 3D 점군 — 어디에 점이 찍혔는지, 부재가 제대로 갈렸는지
+    pc_png = REPORT.save_pointcloud_3d(
+        os.path.join(out_dir, "3D점군.png"), res, scene["g_hat"],
+        title="3D 점군 — 합성 검증 씬")
+    pc_csv = REPORT.save_pointcloud_csv(
+        os.path.join(out_dir, "3D좌표.csv"), res,
+        g_hat=scene["g_hat"], stride=10)
     xlsx = XLS.save_excel(os.path.join(out_dir, "품질검측조서.xlsx"), res,
                           meta=meta, label_pixels=label_px,
-                          seg_image_path=seg_png, extra_caveats=caveats)
+                          seg_image_path=seg_png, extra_caveats=caveats,
+                          g_hat=scene["g_hat"], pointcloud_image=pc_png,
+                          pc_stride=10)
     REPORT.save_record(REPORT.build_record(res, meta),
                        os.path.join(out_dir, "조서.json"))
     print()
     print(f"세그멘테이션 이미지: {seg_png}")
+    if pc_png:
+        print(f"3D 점군 이미지:     {pc_png}")
+    if pc_csv:
+        print(f"3D 좌표 CSV:       {pc_csv}")
     print(f"엑셀 조서:          {xlsx}")
     return 0
 

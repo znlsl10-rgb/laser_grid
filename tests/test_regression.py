@@ -31,6 +31,13 @@ EQ5 = _load("eq5_region_assign")
 PIPE = _load("pipeline_region")
 SYN = _load("synth_scene")
 CALIB = _load("calibration")
+DET = _load("A_선검출")
+EQ7 = _load("eq7_laser_plane")
+REPORT = _load("report")
+# synth_scene 은 자기 인스턴스의 calibration 을 본다. _load 는 호출마다
+# 새 모듈을 만들므로, 위의 CALIB 에 use_profile 을 걸어도 합성 씬은 옛
+# 프로파일로 남는다. 씬을 만드는 검증은 이쪽을 써야 한다.
+SYN_CALIB = SYN._CALIB
 
 _FAILS = []
 
@@ -429,6 +436,280 @@ def test_boundary_rejection():
           EQ5.erode_mask(m, 3).sum() == 196)
 
 
+def test_eq7_laser_plane():
+    """[9] eq7 레이저 평면 — V·H 를 한 식으로, 깊이 이득 g"""
+    print("\n[9] eq7 레이저 평면 일반화 — 가로선(H) 을 쓸 수 있는 조건")
+    f, b, cx, cy = 1593.0, 0.150, 1224.0, 1024.0
+    rng = np.random.default_rng(4)
+
+    # (1) V선에서 eq1 과 완전히 같은 값이어야 한다.
+    #     여기가 어긋나면 기존 검증값이 통째로 무의미해진다.
+    worst = 0.0
+    for _ in range(500):
+        al = np.radians(rng.uniform(-30, 30))
+        Z = rng.uniform(0.8, 6.0)
+        u = f * (Z * np.tan(al) - b) / Z + cx
+        v = f * (Z * rng.uniform(-0.5, 0.5)) / Z + cy
+        xyz, _ = EQ7.triangulate_plane([[u, v]], EQ7.plane_normal("alpha", al),
+                                       f, b, cx, cy)
+        ref = EQ1.triangulate_point(u, v, al, 0.0, f, b, cx, cy)
+        worst = max(worst, float(np.max(np.abs(xyz[0] - np.array(ref)))))
+    check(f"eq1 과 동일 (V선 500점) 최대차 {worst*1e9:.3f} nm", worst < 1e-9)
+
+    # (2) 이득 공식 g = √(n_x²+n_y²)/|n_x| 이 실제 잡음 증폭과 맞는가
+    for label, fixed, ang, roll in (("V roll 0°", "alpha", 10.0, 0.0),
+                                    ("H roll45°", "beta", 20.0, 45.0),
+                                    ("H roll20°", "beta", 20.0, 20.0)):
+        n = EQ7.plane_normal(fixed, np.radians(ang),
+                             roll_rad=np.radians(roll))
+        m = np.array([n[0], n[1]]); m = m / np.linalg.norm(m)
+        Zc = 2.7
+        K = n[2] + n[0] * b / Zc
+        if abs(n[1]) > 1e-9:
+            uh0 = 0.05; vh0 = -(n[0] * uh0 + K) / n[1]
+        else:
+            uh0 = -K / n[0]; vh0 = 0.02
+        e = rng.normal(0, 0.3, 20000)
+        uv = np.column_stack([cx + f * uh0 + e * m[0],
+                              cy + f * vh0 + e * m[1]])
+        xyz, _ = EQ7.triangulate_plane(uv, n, f, b, cx, cy)
+        sig = float(np.std(xyz[:, 2])) * 1000.0
+        pred = EQ7.depth_gain(n) * 0.3 * Zc ** 2 / (f * b) * 1000.0
+        check(f"이득 g={EQ7.depth_gain(n):.3f} ({label}) — 실측 σ_Z "
+              f"{sig:.2f}mm vs 예측 {pred:.2f}mm",
+              abs(sig - pred) < 0.05 * pred)
+
+    # (3) 굴리지 않은 H선은 원리적으로 깊이가 없어야 한다.
+    #     이것이 "가로선을 검출해도 깊이에 못 쓴다" 의 근거다.
+    n0 = EQ7.plane_normal("beta", np.radians(20.0))
+    check("굴림 0° 의 H선 이득 = ∞ (평면이 기선을 품음)",
+          not np.isfinite(EQ7.depth_gain(n0)),
+          f"n_x={n0[0]:.3e}")
+    n45 = EQ7.plane_normal("beta", np.radians(20.0), roll_rad=np.radians(45))
+    check(f"굴림 45° 의 H선 이득 {EQ7.depth_gain(n45):.3f} = √2 → 사용 가능",
+          abs(EQ7.depth_gain(n45) - np.sqrt(2)) < 1e-9
+          and EQ7.depth_gain(n45) <= EQ7.MAX_DEPTH_GAIN)
+
+    # (4) 프로파일별 — 굴림이 있어야만 가로선이 깊이 표본이 된다
+    keep = CALIB.ACTIVE_PROFILE
+    for name, want_h in (("legacy", False), ("pdf", False),
+                         ("improved", False), ("diagonal", True)):
+        CALIB.use_profile(name)
+        la = CALIB.make_line_angles()
+        pl = EQ7.line_planes(la)
+        nh = sum(1 for l, p in pl.items() if l[0] == "H" and p["usable"])
+        nv = sum(1 for l, p in pl.items() if l[0] == "V" and p["usable"])
+        check(f"[{name}] V선 깊이가능 {nv}개 / H선 깊이가능 {nh}개",
+              nv > 0 and ((nh > 0) == want_h))
+    CALIB.use_profile(keep)
+
+
+def test_h_lines_in_pipeline():
+    """[10] 가로선이 실제로 삼각측량·검측까지 들어가는가"""
+    print("\n[10] 가로선(H) 파이프라인 통합")
+    keep = CALIB.ACTIVE_PROFILE
+    keep_p = dict(CALIB.SPEC_PROFILES["diagonal"])
+    keep_s = dict(SYN_CALIB.SPEC_PROFILES["diagonal"])
+    keep_sp = SYN_CALIB.ACTIVE_PROFILE
+    try:
+        # 굴리지 않은 사양 — 가로선은 사유와 함께 걸러져야 한다
+        CALIB.use_profile("legacy")
+        la = CALIB.make_line_angles()
+        cp = dict(CALIB.CAMERA_PARAMS)
+        lp = {lid: [[cp["cx_px"] + 10.0 * k, cp["cy_px"] + 3.0 * k]
+                    for k in range(30)] for lid in la}
+        xyz, uv, info = PIPE.triangulate_lines(lp, la, cp)
+        h_used = [l for l in xyz if l.startswith("H")]
+        h_skip = [(l, w) for l, w in info["skipped"] if l.startswith("H")]
+        check(f"[legacy] 가로선 {len(h_skip)}개가 사유와 함께 제외됨",
+              len(h_used) == 0 and len(h_skip) == CALIB.N_HORIZONTAL,
+              (h_skip[0][1] if h_skip else ""))
+        check("[legacy] 세로선은 그대로 삼각측량됨",
+              len([l for l in xyz if l.startswith("V")]) > 0)
+
+        # 굴린 사양 — 합성 씬 전체를 돌려 가로선 점이 검측까지 들어가는지
+        SYN_CALIB.SPEC_PROFILES["diagonal"].update(
+            {"n_vertical": 20, "n_horizontal": 20, "laser_roll_deg": 45.0})
+        SYN_CALIB.use_profile("diagonal")
+        CALIB.use_profile("diagonal")
+        SYN.CAMERA_PARAMS.clear()
+        SYN.CAMERA_PARAMS.update(SYN_CALIB.CAMERA_PARAMS)
+        SYN.GRID.update({"n_vertical": 20, "n_horizontal": 20,
+                         "fov_deg": SYN_CALIB.FOV_DEG,
+                         "samples_per_line": 250})
+        sc = SYN.build_scene(seed=2026, sigma_u_px=SYN_CALIB.SIGMA_U_PX)
+        nh_emit = sum(1 for l in sc["lines_pixels"] if l.startswith("H"))
+        check(f"[diagonal] 합성 씬이 가로선 {nh_emit}개를 실제로 쏨",
+              nh_emit > 0)
+        res = PIPE.inspect_capture(
+            sc["lines_pixels"], sc["line_angles"], sc["camera_params"],
+            sc["R_world_cam"], label_map=sc["label_map"],
+            id_to_semantic=sc["id_to_semantic"], rgb_off=sc["rgb_off"],
+            backend="gt")
+        nf = res["triangulation"]["n_by_family"]
+        check(f"[diagonal] 삼각측량 점 V {nf.get('V', 0):,} + "
+              f"H {nf.get('H', 0):,}", nf.get("H", 0) > 0)
+        wall = [r for r in res["regions"]
+                if r["class"] == "wall" and r["status"] == "measured"]
+        check("[diagonal] 벽 영역이 측정됨", len(wall) == 1)
+        if wall:
+            lids = np.asarray(wall[0]["point_lid"], dtype=object)
+            frac = float(np.mean([str(x).startswith("H") for x in lids]))
+            check(f"[diagonal] 벽 점의 {frac*100:.0f}% 가 가로선에서 옴",
+                  frac > 0.2)
+            err = abs(wall[0]["theta_deg"] - SYN.GT_WALL_TILT_DEG)
+            check(f"[diagonal] 벽 수직도 {wall[0]['theta_deg']:.4f}° "
+                  f"(정답 {SYN.GT_WALL_TILT_DEG}°) 오차 {err:.4f}°",
+                  err <= 0.5)
+    finally:
+        CALIB.SPEC_PROFILES["diagonal"].update(keep_p)
+        CALIB.use_profile(keep)
+        SYN_CALIB.SPEC_PROFILES["diagonal"].update(keep_s)
+        SYN_CALIB.use_profile(keep_sp)
+        SYN.CAMERA_PARAMS.clear()
+        SYN.CAMERA_PARAMS.update(SYN_CALIB.CAMERA_PARAMS)
+        SYN.GRID.update({"n_vertical": SYN_CALIB.N_VERTICAL,
+                         "n_horizontal": SYN_CALIB.N_HORIZONTAL,
+                         "fov_deg": SYN_CALIB.FOV_DEG,
+                         "samples_per_line": 250})
+
+
+def test_pointcloud_export():
+    """[11] 부재별 3D 좌표 산출"""
+    print("\n[11] 부재별 3D 좌표 — 점이 어디에 찍혔는가")
+    sc = SYN.build_scene(seed=2026, sigma_u_px=CALIB.SIGMA_U_PX)
+    res = PIPE.inspect_capture(
+        sc["lines_pixels"], sc["line_angles"], sc["camera_params"],
+        sc["R_world_cam"], label_map=sc["label_map"],
+        id_to_semantic=sc["id_to_semantic"], rgb_off=sc["rgb_off"],
+        backend="gt")
+    got = [r for r in res["regions"] if r.get("point_xyz") is not None]
+    check(f"모든 영역이 3D 점을 들고 있다 ({len(got)}/{len(res['regions'])})",
+          len(got) == len(res["regions"]) and len(got) > 0)
+    # 검측에 쓴 점과 같은 배열이어야 한다 — 어긋나면 그림이 거짓말을 한다
+    ok = all(len(r["point_xyz"]) == r["n_points"] for r in got)
+    check("3D 점 수 = 검측에 쓴 점 수", ok)
+
+    # 중력 정렬 좌표: 벽은 서 있고 바닥은 누워 있어야 한다
+    R = REPORT.world_frame(sc["g_hat"])
+    check("중력 정렬 기저가 정규직교",
+          float(np.abs(R.T @ R - np.eye(3)).max()) < 1e-9)
+    summ = REPORT.region_xyz_summary(res, g_hat=sc["g_hat"])
+    byc = {d["클래스"]: d for d in summ}
+    if "wall" in byc and "floor" in byc:
+        w, fl = byc["wall"], byc["floor"]
+        check(f"벽은 높이폭 {w['높이폭_m']}m > 깊이폭 {w['깊이폭_m']}m (서 있다)",
+              w["높이폭_m"] > w["깊이폭_m"])
+        check(f"바닥은 깊이폭 {fl['깊이폭_m']}m > 높이폭 {fl['높이폭_m']}m (누워 있다)",
+              fl["깊이폭_m"] > fl["높이폭_m"])
+    rows = REPORT.region_xyz_rows(res, g_hat=sc["g_hat"], stride=50)
+    check(f"좌표 표 {len(rows):,}행 — 부재 구분 열 포함",
+          len(rows) > 0 and "클래스" in rows[0] and "높이_m" in rows[0])
+
+
+def _plane_grid_pixels(roll_deg, nv=14, nh=14, z0=1.20, tilt_deg=3.0,
+                       n_samples=6000):
+    """살짝 기운 단일 평면에 격자를 쏘고 화소를 해석적으로 만든다."""
+    CALIB.SPEC_PROFILES["diagonal"].update(
+        {"n_vertical": nv, "n_horizontal": nh, "laser_roll_deg": roll_deg})
+    CALIB.use_profile("diagonal")
+    f, b = CALIB.F_PX, CALIB.BASELINE_M
+    cx, cy = CALIB.CX_PX, CALIB.CY_PX
+    W, H = CALIB.IMAGE_W, CALIB.IMAGE_H
+    la = CALIB.make_line_angles()
+    t = np.radians(tilt_deg)
+    m = np.array([np.sin(t), 0.0, -np.cos(t)]); d0 = z0 * np.cos(t)
+    ts = np.linspace(-np.radians(CALIB.FOV_DEG) / 2,
+                     np.radians(CALIB.FOV_DEG) / 2, n_samples)
+    pix = {}
+    for lid, info in la.items():
+        n = np.asarray(info["normal"], float)
+        a = np.array([0.0, 0.0, 1.0]) - n * n[2]; a /= np.linalg.norm(a)
+        c = np.cross(n, a); c /= np.linalg.norm(c)
+        dirs = np.cos(ts)[:, None] * a + np.sin(ts)[:, None] * c
+        den = dirs @ m
+        ok = np.abs(den) > 1e-9
+        sarr = np.full(len(dirs), np.nan); sarr[ok] = -d0 / den[ok]
+        good = np.isfinite(sarr) & (sarr > 0.2) & (sarr < 5.0)
+        P = dirs[good] * sarr[good, None]
+        if len(P) < 50:
+            continue
+        u = f * (P[:, 0] - b) / P[:, 2] + cx
+        v = f * P[:, 1] / P[:, 2] + cy
+        ins = (u >= 2) & (u < W - 2) & (v >= 2) & (v < H - 2)
+        if ins.sum() < 50:
+            continue
+        pix[lid] = np.column_stack([u[ins], v[ins]])
+    cp = dict(f_px=f, b_m=b, cx_px=cx, cy_px=cy, image_w=W, image_h=H,
+              n_v=nv, n_h=nh, fov_h_deg=CALIB.FOV_DEG,
+              fov_v_deg=CALIB.FOV_DEG, standoff_z=z0,
+              z_range=[z0 * 0.93, z0 * 1.07])
+    return pix, la, cp
+
+
+def _render_lines(pix, W, H, width=1.5):
+    """선 화소를 가우시안으로 그려 넣은 초록 레이저 영상."""
+    acc = np.zeros((H, W), np.float32)
+    for P in pix.values():
+        for u, v in P:
+            u0, v0 = int(u), int(v)
+            for dv in range(-2, 3):
+                for du in range(-2, 3):
+                    x, y = u0 + du, v0 + dv
+                    if 0 <= x < W and 0 <= y < H:
+                        d = np.hypot(x - u, y - v)
+                        acc[y, x] = max(acc[y, x],
+                                        float(np.exp(-0.5 * (d / width) ** 2)))
+    img = np.zeros((H, W, 3), np.float32)
+    img[:, :, 1] = acc * 255.0
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def test_rolled_grid_detection():
+    """[12] 굴린 격자에서 선검출이 되는가 (렌더 → 검출 → 정답 대조)"""
+    print("\n[12] 굴린 격자 선검출 — 두 계열이 모두 대각선일 때")
+    keep = CALIB.ACTIVE_PROFILE
+    keep_p = dict(CALIB.SPEC_PROFILES["diagonal"])
+    try:
+        for roll in (0.0, 45.0):
+            pix, la, cp = _plane_grid_pixels(roll)
+            img = _render_lines(pix, cp["image_w"], cp["image_h"])
+            det = DET.detect(img, {}, la, cp, multi_surface=True)
+            c = np.array([cp["cx_px"], cp["cy_px"]])
+            stat = {}
+            for lid, g in pix.items():
+                d = np.asarray(det.get(lid, []), float)
+                if len(d) < 10:
+                    stat.setdefault(lid[0], []).append(None)
+                    continue
+                n = np.asarray(la[lid]["normal"], float)
+                lat = np.hypot(n[0], n[1])
+                mh = np.array([n[0], n[1]]) / lat
+                th = np.array([-mh[1], mh[0]])
+                tg, ng = (g - c) @ th, (g - c) @ mh
+                td, nd = (d - c) @ th, (d - c) @ mh
+                o = np.argsort(tg)
+                msk = (td >= tg[o][0]) & (td <= tg[o][-1])
+                if msk.sum() < 10:
+                    stat.setdefault(lid[0], []).append(None)
+                    continue
+                e = nd[msk] - np.interp(td[msk], tg[o], ng[o])
+                stat.setdefault(lid[0], []).append(
+                    (float(np.median(e)), float(np.std(e))))
+            for pre in "VH":
+                v = stat.get(pre) or []
+                ok = [x for x in v if x is not None and abs(x[0]) < 1.0
+                      and x[1] < 1.0]
+                bias = (np.median([x[0] for x in ok]) if ok else float("nan"))
+                sc = (np.median([x[1] for x in ok]) if ok else float("nan"))
+                check(f"굴림 {roll:g}° {pre}선 {len(ok)}/{len(v)} 검출 "
+                      f"— 법선방향 편차 {bias:+.3f}px, 산포 {sc:.3f}px",
+                      len(v) > 0 and len(ok) == len(v))
+    finally:
+        CALIB.SPEC_PROFILES["diagonal"].update(keep_p)
+        CALIB.use_profile(keep)
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -436,7 +717,9 @@ def main():
     for t in (test_hardware_spec, test_eq1_triangulation, test_eq3_backward_compat,
               test_gravity_paths_agree, test_tls_plane_vs_legacy,
               test_axis_fit, test_region_pipeline,
-              test_segmentation_robustness, test_boundary_rejection):
+              test_segmentation_robustness, test_boundary_rejection,
+              test_eq7_laser_plane, test_h_lines_in_pipeline,
+              test_pointcloud_export, test_rolled_grid_detection):
         t()
     print("\n" + "=" * 70)
     if _FAILS:

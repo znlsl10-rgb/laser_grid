@@ -42,6 +42,7 @@ _EQ3 = _load("eq3_orientation")
 _EQ4 = _load("eq4_flatness_line")
 _EQ5 = _load("eq5_region_assign")
 _EQ6 = _load("eq6_straightedge")
+_EQ7 = _load("eq7_laser_plane")
 _SEG = _load("C_영역분할")
 
 # 평활도 허용 기준 (PDF 1.2 표: 노출 콘크리트 3m당 7mm, 미장 1m당 10mm 등).
@@ -105,6 +106,11 @@ def _defects_in_image(fd, camera_params):
             "extent_mm": round(float(c["extent_mm"]), 1),
             "n_points": int(c["n_points"]),
             "z_m": round(float(np.median(Z)), 3),
+            # 3D 산점도가 요철 위치를 찍으려면 조사기 좌표가 필요하다.
+            # 화소 좌표만으로는 깊이를 되돌릴 수 없다.
+            "center_xyz": [round(float(P[:, 0].mean()), 5),
+                           round(float(P[:, 1].mean()), 5),
+                           round(float(P[:, 2].mean()), 5)],
         })
     out.sort(key=lambda d: -abs(d["depth_mm"]))
     return out
@@ -347,7 +353,7 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
                   erode_default_px=3, erode_thin_px=1,
                   min_region_points=12, sigma_u_px=0.2,
                   target_sigma_mm=2.0, flatness_threshold_mm=1.5,
-                  split_incoherent=True):
+                  split_incoherent=True, line_gain=None):
     """
     선검출 결과 + 삼각측량 결과 + 세그멘테이션으로 영역별 검측을 수행한다.
 
@@ -360,6 +366,11 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
     rgb_off      : (H,W,3) 레이저 OFF 프레임 — 세그멘테이션 입력
     seg_backend  : "gt" | "geom" | "sam" | "vlm"
     seg_kwargs   : 백엔드 인자 (gt → label_map, id_to_semantic)
+    line_gain    : {lid: g} | None
+        선별 깊이 이득 (eq7). 주면 영역마다 그 영역을 이룬 점들의
+        RMS 이득으로 σ_u 를 부풀려 불확실도를 계산한다. 이득이 큰
+        선(굴린 격자의 가로선)의 점은 같은 화소 오차라도 깊이가 더
+        흔들리므로, 이걸 반영하지 않으면 평활도가 실제보다 좋게 나온다.
 
     Returns
     -------
@@ -457,10 +468,20 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
                 fu = _EQ5.fuse_label(part_cls, ev)
             final_cls = fu["final_class"]
 
+            # 이 영역을 이룬 점들의 깊이 이득 (RMS). 분산이 g² 로
+            # 커지므로 평균이 아니라 제곱평균제곱근이 맞는 집계다.
+            g_rms = 1.0
+            if line_gain:
+                gs = np.array([line_gain.get(l, 1.0)
+                               for l in table["lid"][keep]], dtype=float)
+                gs = gs[np.isfinite(gs)]
+                if len(gs):
+                    g_rms = float(np.sqrt(np.mean(gs ** 2)))
             r = measure_region(pts, final_cls, g_hat, camera_params,
                                flatness_threshold_mm=flatness_threshold_mm,
-                               sigma_u_px=sigma_u_px,
+                               sigma_u_px=sigma_u_px * g_rms,
                                target_sigma_mm=target_sigma_mm)
+            r["depth_gain_rms"] = round(g_rms, 3)
             r["region_id"] = int(reg["class_id"])
             r["label_fusion"] = {k: v for k, v in fu.items() if k != "note"}
             r["label_fusion_note"] = fu["note"]
@@ -469,6 +490,11 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
             # 결과 이미지·엑셀에서 쓰는 화소 좌표 (검측에는 쓰지 않는다)
             r["point_uv"] = table["uv"][keep]
             r["point_idx"] = keep
+            # 이 부재를 이룬 3D 점 그대로. 3D 산점도·좌표 내보내기가 쓴다.
+            # 검측에 들어간 점과 **같은 배열** 이어야 그림과 조서가 어긋나지
+            # 않는다(선형 정제로 걸러낸 점은 여기에도 없다).
+            r["point_xyz"] = pts
+            r["point_lid"] = table["lid"][keep]
             results.append(r)
 
     measured = [r for r in results if r["status"] == "measured"]
@@ -515,51 +541,83 @@ def _regions_from_point_labels(table, point_labels, class_names, min_points=12):
 # =====================================================================
 # 촬영 결과 → 검측 (Isaac 비의존)
 # =====================================================================
-def triangulate_lines(lines_pixels, line_angles, camera_params):
+def triangulate_lines(lines_pixels, line_angles, camera_params,
+                      max_depth_gain=None):
     """
-    검출된 선의 픽셀점을 eq1 로 3D 로 되돌린다.
+    검출된 선의 화소점을 3D 로 되돌린다 (eq7 평면식).
 
-    V선만 처리하는 이유
-    ------------------
-    기선이 X축 방향이라 시차는 u 좌표에만 나타나고, 깊이를 풀려면 그 점의
-    발사각 α 를 알아야 한다.
-      · V선 : α 가 선마다 고정 → 선을 따라 조밀 샘플링해도 전부 풀린다
-      · H선 : β 만 고정이고 α 는 점마다 다르다. v 좌표는 (v-c_y)/f = tanβ
-              라는 이미 아는 사실만 되풀이하므로 깊이 정보가 없다.
-    따라서 H선은 V선과의 교점에서만 α 를 회복할 수 있고, 그 교점은 이미
-    V선 샘플에 포함된다. V선 조밀 샘플링이 곧 완전한 정보다.
+    V선·H선을 함께 푸는 이유
+    ----------------------
+    예전에는 eq1 의 V선 전용식만 써서 H선을 통째로 버렸다. 그 근거는
+    "기선이 X축이라 H선은 시차가 선과 나란해 깊이가 안 풀린다" 였고,
+    회전이 없는 격자에서는 그 말이 맞다. 다만 그것은 H선의 성질이 아니라
+    **격자를 굴리지 않았을 때만** 성립하는 조건이다.
+
+    eq7 은 선을 각도가 아니라 레이저 평면 법선 n 으로 다룬다.
+
+        Z = − n_x·b / (n_x·û + n_y·v̂ + n_z)
+
+    이 식에서 깊이가 풀리는지는 오직 n_x 가 0 이 아닌지에 달렸고, 그
+    민감도는 이득 g = √(n_x²+n_y²)/|n_x| 하나로 표현된다. V선은 g=1,
+    회전 없는 H선은 g=∞(원리적으로 불가), 45° 굴린 격자는 양쪽 다
+    g=√2 다. 그래서 판정 기준을 "H선인가" 가 아니라 "이 선의 g 가
+    쓸 만한가" 로 바꾼다. 하드웨어가 격자를 굴려 오면 코드를 고치지
+    않아도 가로선이 그대로 깊이 표본이 된다.
+
+    버린 선은 skipped 에 이유와 함께 남긴다. 조용히 사라지면 "왜 점이
+    절반인가" 를 조서에서 되짚을 수 없다.
 
     Returns
     -------
     lines_xyz : {lid: [(X,Y,Z), ...]}
     lines_uv  : {lid: [(u,v), ...]}   삼각측량에 성공한 점만 (순서 일치)
+    info      : dict
+        skipped     : [(lid, 사유), ...]
+        line_gain   : {lid: g}          쓰인 선의 깊이 이득
+        family      : eq7.family_summary  V/H 계열 요약
+        n_by_family : {"V": 점수, "H": 점수}
     """
     f = float(camera_params["f_px"]); b = float(camera_params["b_m"])
     cx = float(camera_params["cx_px"]); cy = float(camera_params["cy_px"])
-    lines_xyz, lines_uv, skipped = {}, {}, []
+    gmax = _EQ7.MAX_DEPTH_GAIN if max_depth_gain is None else float(max_depth_gain)
 
+    # 법선은 line_angles 에 이미 들어 있으면 그것을 쓴다(캘리브레이션이
+    # 평면을 직접 잰 경우). 없으면 발사각과 장비 회전각에서 만든다.
+    tilt = np.radians(float(camera_params.get("laser_tilt_deg", 0.0) or 0.0))
+    roll = np.radians(float(camera_params.get("laser_roll_deg", 0.0) or 0.0))
+    planes = _EQ7.line_planes(line_angles, tilt_rad=tilt, roll_rad=roll)
+
+    lines_xyz, lines_uv, skipped = {}, {}, []
+    line_gain, n_by_family = {}, {}
     for lid, pts in lines_pixels.items():
-        info = line_angles.get(lid)
-        if info is None:
+        pl = planes.get(lid)
+        if pl is None:
+            skipped.append((lid, "발사각 미상"))
             continue
-        if info.get("fixed") != "alpha":
-            skipped.append(lid)
+        g = pl["gain"]
+        if not np.isfinite(g):
+            skipped.append((lid, "깊이 정보 없음 (평면이 기선을 품음, g=∞)"))
             continue
-        alpha = float(info["angle_rad"])
-        xyz, uv = [], []
-        for p in pts:
-            u, v = float(p[0]), float(p[1])
-            try:
-                X, Y, Z = _EQ1.triangulate_point(u, v, alpha, 0.0, f, b, cx, cy)
-            except ValueError:
-                continue                      # 시차 음수 = 캘리브레이션 이상
-            if not np.isfinite(Z) or Z <= 0:
-                continue
-            xyz.append([X, Y, Z]); uv.append([u, v])
-        if len(xyz) >= 5:
-            lines_xyz[lid] = xyz
-            lines_uv[lid] = uv
-    return lines_xyz, lines_uv, skipped
+        if g > gmax:
+            skipped.append((lid, f"깊이 이득 과대 (g={g:.1f} > {gmax:g})"))
+            continue
+        arr = np.asarray(pts, dtype=float).reshape(-1, 2)
+        if len(arr) == 0:
+            continue
+        xyz, keep = _EQ7.triangulate_plane(arr, pl["normal"], f, b, cx, cy)
+        if len(xyz) < 5:
+            skipped.append((lid, f"유효점 부족 ({len(xyz)})"))
+            continue
+        lines_xyz[lid] = xyz.tolist()
+        lines_uv[lid] = arr[keep].tolist()
+        line_gain[lid] = float(g)
+        fam = lid[0]
+        n_by_family[fam] = n_by_family.get(fam, 0) + len(xyz)
+
+    info = {"skipped": skipped, "line_gain": line_gain,
+            "family": _EQ7.family_summary(planes),
+            "n_by_family": n_by_family, "max_depth_gain": gmax}
+    return lines_xyz, lines_uv, info
 
 
 def inspect_capture(lines_pixels, line_angles, camera_params, R_world_cam,
@@ -584,23 +642,25 @@ def inspect_capture(lines_pixels, line_angles, camera_params, R_world_cam,
                              "(중력 기준 없이는 수직·수평도를 정의할 수 없음).")
         g_hat = _EQ3.gravity_from_camera_rotation(R_world_cam)
 
-    lines_xyz, lines_uv, skipped = triangulate_lines(
+    lines_xyz, lines_uv, tri_info = triangulate_lines(
         lines_pixels, line_angles, camera_params)
     if not lines_xyz:
         return {"regions": [], "summary": {"n_regions": 0},
-                "error": "삼각측량 가능한 V선이 없습니다.",
-                "skipped_lines": skipped}
+                "error": "깊이를 풀 수 있는 선이 없습니다 (eq7 이득 g 초과).",
+                "triangulation": tri_info}
 
     if backend is None:
         backend = "gt" if label_map is not None else "geom"
     seg_kwargs = ({"label_map": label_map, "id_to_semantic": id_to_semantic}
                   if backend == "gt" else {})
 
+    kw.setdefault("line_gain", tri_info["line_gain"])
     res = inspect_image(lines_uv, lines_xyz, camera_params, g_hat,
                         rgb_off=rgb_off, seg_backend=backend,
                         seg_kwargs=seg_kwargs, **kw)
     res["gravity_laser_frame"] = [round(float(x), 6) for x in np.asarray(g_hat)]
-    res["skipped_lines"] = skipped
+    res["triangulation"] = tri_info
+    res["skipped_lines"] = tri_info["skipped"]
     res["n_triangulated"] = int(sum(len(v) for v in lines_xyz.values()))
     return res
 

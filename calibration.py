@@ -37,6 +37,18 @@ synth_scene.py 가 같은 값을 따로 들고 있었고 A_선검출·eq5 는 �
 """
 import os as _os
 import numpy as np
+import importlib.util as _ilu
+
+
+def _load(_name):
+    _sp = _ilu.spec_from_file_location(
+        _name, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                             f"{_name}.py"))
+    _m = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_m)
+    return _m
+
+
+_EQ7 = _load("eq7_laser_plane")
 
 # =====================================================================
 # 하드웨어 사양 (PDF 2.2) — 표에 적힌 값
@@ -184,6 +196,7 @@ SPEC_PROFILES = {
         "lens_focal_mm": 1593.0 * 3.45 / 1000.0,
         "fov_deg": 60.82, "doe_model": "equal_angle",
         "sigma_u_px": 0.2, "laser_tilt_deg": 0.0,
+        "laser_roll_deg": 0.0,
     },
     "pdf": {
         "label": "PDF 원안",
@@ -193,6 +206,7 @@ SPEC_PROFILES = {
         "lens_focal_mm": 8.0, "fov_deg": PDF_FOV_DEG,
         "doe_model": "equal_sine",
         "sigma_u_px": 0.2, "laser_tilt_deg": 6.18,
+        "laser_roll_deg": 0.0,
     },
     "improved": {
         "label": "정확도 개선안",
@@ -202,6 +216,35 @@ SPEC_PROFILES = {
         "lens_focal_mm": 8.0, "fov_deg": PDF_FOV_DEG,
         "doe_model": "equal_sine",
         "sigma_u_px": 0.1, "laser_tilt_deg": 7.40,
+        "laser_roll_deg": 0.0,
+    },
+    # 격자를 광축 둘레로 45° 굴린 안. improved 와 하드웨어는 같고 DOE 를
+    # 얹는 각도만 다르다 — 부품 변경 없이 마운트 각도만 바꾸면 된다.
+    #
+    # 왜 45° 인가
+    #   기선이 X축이라 레이저 평면의 법선에 x 성분이 없으면 시차가 선과
+    #   나란해져 깊이가 안 풀린다(eq7 의 이득 g = √(n_x²+n_y²)/|n_x|).
+    #   회전 없는 H선이 정확히 그 경우로 g=∞ 다. 광축 둘레로 γ 만큼 굴리면
+    #       V선 g = 1/cos γ,   H선 g = 1/sin γ
+    #   이고 두 계열이 같아지는 지점이 γ=45° (양쪽 다 g=√2) 다. 점당
+    #   깊이잡음은 √2 배 나빠지지만 깊이를 주는 선이 40개에서 60개로 늘어
+    #   평면 적합의 평균 정밀도는 본전이고, **가로 방향으로도 깊이 표본이
+    #   생긴다**. 평활도는 직선자를 가로로 대고 그 아래 요철을 보는
+    #   검측이라 이 방향 표본이 없으면 애초에 잴 수가 없다.
+    #
+    # 대가
+    #   · 선이 이미지 대각으로 길어져 화면 밖으로 나가는 구간이 생긴다.
+    #   · 두 계열이 45°/135° 로 만나 교점 각도는 그대로 90° 다(교점 정밀도 유지).
+    #   · V/H 라는 이름은 남지만 화면상으로는 우하향/우상향 대각선이다.
+    "diagonal": {
+        "label": "대각 격자 (H선 깊이 확보)",
+        "pixel_pitch_um": 2.74, "image_w": 3072, "image_h": 2560,
+        "sensor_color": "mono", "optical_filter_nm": 520,
+        "baseline_m": 0.180, "n_vertical": 30, "n_horizontal": 30,
+        "lens_focal_mm": 8.0, "fov_deg": PDF_FOV_DEG,
+        "doe_model": "equal_sine",
+        "sigma_u_px": 0.1, "laser_tilt_deg": 7.40,
+        "laser_roll_deg": 45.0,
     },
 }
 # 기본값은 원본 v4 다. 실제 하드웨어 사양이 확정되지 않았고, 이미 뽑아 둔
@@ -261,6 +304,7 @@ def use_profile(name=None):
     """
     global ACTIVE_PROFILE, PIXEL_PITCH_UM, IMAGE_W, IMAGE_H, BASELINE_M
     global N_VERTICAL, N_HORIZONTAL, LENS_FOCAL_MM, SIGMA_U_PX, LASER_TILT_DEG
+    global LASER_ROLL_DEG
     global SENSOR_COLOR, OPTICAL_FILTER_NM, FOV_DEG, DOE_ANGLE_MODEL
     global F_PX, CX_PX, CY_PX, SENSOR_W_MM, SENSOR_H_MM, SENSOR_DIAG_MM
 
@@ -276,6 +320,8 @@ def use_profile(name=None):
     LENS_FOCAL_MM = p["lens_focal_mm"]
     SIGMA_U_PX = p["sigma_u_px"]
     LASER_TILT_DEG = p["laser_tilt_deg"]
+    # 격자 회전(광축 둘레). 없는 프로파일은 0 — 기존 거동 그대로다.
+    LASER_ROLL_DEG = p.get("laser_roll_deg", 0.0)
     SENSOR_COLOR = p["sensor_color"]
     OPTICAL_FILTER_NM = p["optical_filter_nm"]
     FOV_DEG = p["fov_deg"]
@@ -296,6 +342,7 @@ def use_profile(name=None):
     GRID_PARAMS.clear()
     GRID_PARAMS.update({"n_vertical": N_VERTICAL, "n_horizontal": N_HORIZONTAL,
                         "fov_deg": FOV_DEG, "laser_tilt_deg": LASER_TILT_DEG,
+                        "laser_roll_deg": LASER_ROLL_DEG,
                         "samples_per_line": 250})
     return dict(CAMERA_PARAMS)
 
@@ -316,7 +363,7 @@ def _fan_angles(n, fov_deg, model=None):
 
 
 def make_line_angles(n_v=None, n_h=None, fov_deg=None, laser_tilt_deg=None,
-                     model=None):
+                     model=None, laser_roll_deg=None):
     """
     V선·H선의 발사각을 만든다. 카메라 좌표계 기준이다.
 
@@ -335,11 +382,25 @@ def make_line_angles(n_v=None, n_h=None, fov_deg=None, laser_tilt_deg=None,
     n_h = N_HORIZONTAL if n_h is None else n_h
     fov = FOV_DEG if fov_deg is None else fov_deg
     tilt = np.radians(LASER_TILT_DEG if laser_tilt_deg is None else laser_tilt_deg)
+    roll = np.radians(LASER_ROLL_DEG if laser_roll_deg is None else laser_roll_deg)
     a = {}
+    # 발사각과 함께 **레이저 평면 법선** 을 같이 넣는다. 삼각측량을
+    # 각도가 아니라 평면으로 풀면 V선·H선을 한 식으로 다룰 수 있고
+    # (eq7), 그 평면이 깊이를 줄 수 있는지(이득 g)도 여기서 정해진다.
+    # 수렴각은 α 에 이미 더해 두므로 법선에는 넣지 않는다 — 두 번
+    # 적용하면 안 된다.
     for i, ang in enumerate(_fan_angles(n_v, fov, model) + tilt):
-        a[f"V{i}"] = {"fixed": "alpha", "angle_rad": float(ang)}
+        n = _EQ7.plane_normal("alpha", float(ang), roll_rad=roll)
+        a[f"V{i}"] = {"fixed": "alpha", "angle_rad": float(ang),
+                      "normal": n.tolist(),
+                      "depth_gain": _EQ7.depth_gain(n)}
+    # H선의 수렴각은 β 에 더할 수 없다(회전축이 다르다). 법선을 Y축
+    # 둘레로 직접 돌린다.
     for j, ang in enumerate(_fan_angles(n_h, fov, model)):
-        a[f"H{j}"] = {"fixed": "beta", "angle_rad": float(ang)}
+        n = _EQ7.plane_normal("beta", float(ang), tilt_rad=tilt, roll_rad=roll)
+        a[f"H{j}"] = {"fixed": "beta", "angle_rad": float(ang),
+                      "normal": n.tolist(),
+                      "depth_gain": _EQ7.depth_gain(n)}
     return a
 
 

@@ -50,6 +50,20 @@ A_선검출.py — [품질검측 알고리즘 A] 20×20 그리드 레이저 선�
 ========================================================================
 """
 import numpy as np
+import os as _os
+import importlib.util as _ilu
+
+
+def _load(_name):
+    _sp = _ilu.spec_from_file_location(
+        _name, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                             f"{_name}.py"))
+    _m = _ilu.module_from_spec(_sp); _sp.loader.exec_module(_m)
+    return _m
+
+
+# 굴린 격자(roll)에서는 선이 이미지에서 기울어 예측식이 달라진다.
+_EQ7 = _load("eq7_laser_plane")
 try:
     from scipy.optimize import curve_fit as _curve_fit
     _SCIPY = True
@@ -159,6 +173,51 @@ def detect(rgb_image, lines_pixels_raycast, line_angles, camera_params,
         return _fallback_geom(v_lids, h_lids, camera_params, H_img, W_img,
                               line_angles)
 
+    # ── Step1b: 계열 분리 (굴린 격자에서만) ─────────────────────────
+    # 굴리지 않은 격자는 V=세로·H=가로라 스캔축만으로 갈리지만, 굴리면
+    # 두 계열이 모두 대각선이 되어 한 행에 둘 다 지난다. 그대로 두면
+    # 추적기가 옆 계열 능선을 물고 따라간다(실측: 45° 굴림에서 14선 중
+    # 3선만 정상). 능선 방향으로 갈라 각 계열에 자기 화소만 준다.
+    ang_v = _family_direction(v_lids, line_angles, np.pi / 2.0)
+    ang_h = _family_direction(h_lids, line_angles, 0.0)
+    tilt_v = abs(((ang_v - np.pi / 2.0 + np.pi / 2.0) % np.pi) - np.pi / 2.0)
+    diff_v = diff_h = diff
+    rolled = bool(np.degrees(tilt_v) > 10.0
+                  and all("normal" in (line_angles.get(l) or {})
+                          for l in v_lids + h_lids))
+    if rolled:
+        mv, mh = _family_masks(diff, ang_v, ang_h)
+        diff_v, diff_h = diff * mv, diff * mh
+        print(f"  [A] 굴린 격자 (V선 {np.degrees(ang_v):+.1f}° / "
+              f"H선 {np.degrees(ang_h):+.1f}°) → 계열 분리 + 방향 추적")
+        z_ref = float(camera_params.get("standoff_z", 1.2))
+        if z_ref > 10:
+            z_ref /= 1000.0
+        f = float(camera_params.get("f_px", 2318.8))
+        b = float(camera_params.get("b_m", 0.150))
+        cx = float(camera_params.get("cx_px", W_img / 2.0))
+        cy = float(camera_params.get("cy_px", H_img / 2.0))
+        out = {}
+        for lids, src, fb in ((v_lids, diff_v, spacing_v),
+                              (h_lids, diff_h, spacing_h)):
+            sp = _perp_spacings(lids, line_angles, z_ref, f, b, fb)
+            for lid in lids:
+                nrm = line_angles[lid]["normal"]
+                # 밴드는 수직 간격의 40% 를 넘기지 않는다. 넘기면 이웃 선의
+                # 능선이 밴드에 들어와 무게중심이 그쪽으로 끌린다.
+                bd = max(8.0, min(float(sp[lid]) * 0.40, 60.0))
+                pts = _trace_line_oriented(
+                    src, nrm, z_ref, f, b, cx, cy, (H_img, W_img), band=bd,
+                    subpix_half=_subpix_half,
+                    max_offset=float(sp[lid]) * 0.25)
+                if len(pts) >= 10:
+                    out[lid] = pts
+        ok_v = sum(1 for l in v_lids if len(out.get(l, [])) >= 10)
+        ok_h = sum(1 for l in h_lids if len(out.get(l, [])) >= 10)
+        print(f"  [A] 완료(방향 추적): V={ok_v}/{n_v}  H={ok_h}/{n_h} "
+              f"[{_sig_mode}]")
+        return out
+
     # ── Step2: 기하 예측 테이블 생성 ─────────────────────────────────
     # 우선순위: (1) raycast 있으면 보간 테이블, (2) 없으면 기하 계산
     v_tables, v_centers, v_ranges = _build_tables_v(
@@ -176,7 +235,7 @@ def detect(rgb_image, lines_pixels_raycast, line_angles, camera_params,
         v_lo = max(0,       int(v_lo) - MARGIN)
         v_hi = min(H_img-1, int(v_hi) + MARGIN)
         b_base, b_max = band_v[vl]   # DOE 실제 간격 기반 선별 BAND
-        pts = _trace_line(diff, table, u_fallback,
+        pts = _trace_line(diff_v, table, u_fallback,
                           b_base, b_max,
                           axis="V", img_size=(H_img, W_img),
                           scan_range=(v_lo, v_hi), subpix_half=_subpix_half)
@@ -191,7 +250,7 @@ def detect(rgb_image, lines_pixels_raycast, line_angles, camera_params,
         u_lo = max(0,       int(u_lo) - MARGIN)
         u_hi = min(W_img-1, int(u_hi) + MARGIN)
         b_base, b_max = band_h[hl]   # DOE 실제 간격 기반 선별 BAND
-        pts = _trace_line(diff, table, v_fallback,
+        pts = _trace_line(diff_h, table, v_fallback,
                           b_base, b_max,
                           axis="H", img_size=(H_img, W_img),
                           scan_range=(u_lo, u_hi), subpix_half=_subpix_half)
@@ -322,8 +381,22 @@ def _geom_u_for_vline(lid, camera_params, H_img, line_angles):
     # 앞에 선 부재(동바리·기둥)는 벽보다 가까워 시차가 더 크므로, 벽
     # 기준 하나로 예측하면 그 선들이 밴드 밖으로 나간다. 실제로 기둥
     # 3개에 걸린 선이 25~32px 떨어져 통째로 미검출되었다.
-    u_pred = f * np.tan(alpha) - 0.5 * f * b * (1.0 / z_near + 1.0 / z_far) + cx
-    # 원근 보정: 거리와 카메라 틸트 없으면 V선은 이미지 전체에서 u가 일정
+    z_mid = 2.0 / (1.0 / z_near + 1.0 / z_far)      # 시차의 조화중간
+    # ── 격자를 굴린 사양(roll)이면 선이 이미지에서 기울어진다 ──
+    # 굴리지 않으면 V선은 모든 행에서 u 가 같지만, 굴리면 행마다 u 가
+    # 달라진다. 같은 값을 전 행에 깔면 밴드가 선을 비껴가 위아래 끝에서
+    # 통째로 놓친다. 평면 법선이 있으면 eq7 로 행별 예측을 만든다.
+    n = ang.get("normal")
+    if n is not None:
+        cy = camera_params.get("cy_px",
+                               camera_params.get("cy",
+                                                 H_default(camera_params) / 2))
+        pred = _EQ7.predicted_uv(np.asarray(n, float), z_mid, f, b, cx, cy,
+                                 along="v", n_samples=H_img)
+        if pred is not None:
+            return pred[:, 0]
+    u_pred = f * np.tan(alpha) - f * b / z_mid + cx
+    # 굴림 없는 격자에서 V선은 이미지 전체에서 u 가 일정하다
     return np.full(H_img, u_pred, dtype=float)
 
 
@@ -371,6 +444,20 @@ def _geom_v_for_hline(lid, camera_params, W_img, line_angles):
                             camera_params.get("fov_h_deg", 42.61)))
         beta  = _fan_angle(idx, n_h, fov_v)
 
+    # 굴린 격자에서는 H선도 이미지에서 기울고, 게다가 기선 시차가 v 에도
+    # 실린다(굴리지 않으면 v 는 깊이와 무관하다). eq7 예측을 쓴다.
+    n = ang.get("normal")
+    if n is not None:
+        cx = camera_params.get("cx_px",
+                               camera_params.get("cx",
+                                                 W_default(camera_params) / 2))
+        b = camera_params.get("b_m", 0.150)
+        z_near, z_far = _z_span(camera_params)
+        z_mid = 2.0 / (1.0 / z_near + 1.0 / z_far)
+        pred = _EQ7.predicted_uv(np.asarray(n, float), z_mid, f, b, cx, cy,
+                                 along="u", n_samples=W_img)
+        if pred is not None:
+            return pred[:, 1]
     v_pred = f * np.tan(beta) + cy
     return np.full(W_img, v_pred, dtype=float)
 
@@ -539,6 +626,291 @@ def _validate_and_fix(out, lids, centers_hint, raycast,
 # =====================================================================
 # 핵심 추적 함수 (v7 계승 + 개선)
 # =====================================================================
+def _box_blur(a, k):
+    """분리형 박스 필터. scipy 없이 누적합으로 돌린다 (O(N))."""
+    if k < 2:
+        return a
+    r = int(k) // 2
+    out = a
+    for ax in (0, 1):
+        pad = [(0, 0), (0, 0)]
+        pad[ax] = (r, r)
+        b = np.pad(out, pad, mode="edge")
+        c = np.cumsum(b, axis=ax)
+        zero = np.zeros_like(np.take(c, [0], axis=ax))
+        c = np.concatenate([zero, c], axis=ax)
+        n = out.shape[ax]
+        hi = np.take(c, np.arange(2 * r + 1, 2 * r + 1 + n), axis=ax)
+        lo = np.take(c, np.arange(0, n), axis=ax)
+        out = (hi - lo) / float(2 * r + 1)
+    return out
+
+
+def _family_masks(diff, ang_v, ang_h, k=7):
+    """
+    능선 방향으로 V계열·H계열 화소를 갈라 놓는다.
+
+    왜 필요한가
+    ----------
+    격자를 굴리지 않으면 V선은 세로, H선은 가로라 스캔축만으로 갈린다.
+    행을 훑으며 u 를 찾으면 H선은 애초에 걸리지 않는다. 그런데 45° 로
+    굴리면 **두 계열이 모두 대각선** 이 되어, 한 행에 V선도 H선도 한 번씩
+    지난다. 예측 밴드가 40px 인데 교점 근처에서는 두 선이 몇 px 안으로
+    붙으므로, 추적기가 옆 계열 능선을 물고 따라가 버린다. 실측으로
+    45° 굴림에서 14선 중 3선만 제대로 잡혔다.
+
+    두 계열은 서로 **직교** 하므로(V 접선 ∝ (−n_y, n_x), H 접선도 같은 꼴이며
+    굴림에 무관하게 90° 차이), 능선 방향만 알면 깨끗이 가를 수 있다.
+
+    구조텐서로 방향을 구한다.
+        J = box(∇I ∇Iᵀ),  주 기울기 방향 θ = ½·atan2(2J_xy, J_xx − J_yy)
+        능선(선) 방향 = θ + 90°
+    각 화소를 두 기대 방향 중 가까운 쪽에 준다. 임계값이 없는 하드 분할이라
+    맞출 파라미터가 없다.
+
+    Returns
+    -------
+    (mask_v, mask_h) — 같은 크기의 float 배열. 원본에 곱해 쓴다.
+    """
+    gy, gx = np.gradient(diff.astype(np.float32))
+    Jxx = _box_blur(gx * gx, k)
+    Jyy = _box_blur(gy * gy, k)
+    Jxy = _box_blur(gx * gy, k)
+    th = 0.5 * np.arctan2(2.0 * Jxy, Jxx - Jyy)     # 주 기울기 방향
+    line_ang = th + np.pi / 2.0                      # 능선 방향
+    # 방향은 180° 주기다. 각 계열과의 사잇각을 그 주기로 접어 잰다.
+    def _d(a, b):
+        d = np.abs(((a - b + np.pi / 2.0) % np.pi) - np.pi / 2.0)
+        return d
+    dv, dh = _d(line_ang, ang_v), _d(line_ang, ang_h)
+    mv = (dv <= dh).astype(np.float32)
+    mh = 1.0 - mv
+    # 경계를 칼같이 자르면 능선 한 줄이 계단처럼 끊긴다. 살짝 번지게 해
+    # 추적이 이어지도록 두되, 반대 계열은 확실히 눌린다.
+    mv = np.clip(_box_blur(mv, 3), 0.0, 1.0)
+    mh = np.clip(_box_blur(mh, 3), 0.0, 1.0)
+    return mv, mh
+
+
+def _family_direction(lids, line_angles, default):
+    """
+    한 계열의 이미지상 평균 선 방향 [rad].
+
+    깊이 Z 의 정면 평면과의 교선은 (û,v̂) 평면에서 법선이 (n_x, n_y) 인
+    직선이므로, 선 방향은 (−n_y, n_x) 다. 굴림·수렴각이 어떻게 들어와도
+    법선만 있으면 나온다.
+    """
+    vecs = []
+    for lid in lids:
+        n = (line_angles.get(lid) or {}).get("normal")
+        if n is None:
+            continue
+        n = np.asarray(n, float)
+        t = np.array([-n[1], n[0]])
+        if np.linalg.norm(t) < 1e-9:
+            continue
+        a = np.arctan2(t[1], t[0])
+        vecs.append((np.cos(2 * a), np.sin(2 * a)))   # 180° 주기 평균
+    if not vecs:
+        return default
+    c, sN = np.mean(vecs, axis=0)
+    return 0.5 * float(np.arctan2(sN, c))
+
+
+def _sample_bilinear(img, xs, ys):
+    """이미지에서 임의 실수 좌표의 값을 겹선형으로 읽는다."""
+    H, W = img.shape[:2]
+    x = np.clip(xs, 0.0, W - 1.001)
+    y = np.clip(ys, 0.0, H - 1.001)
+    x0 = np.floor(x).astype(np.int64); y0 = np.floor(y).astype(np.int64)
+    fx = x - x0; fy = y - y0
+    x1 = np.minimum(x0 + 1, W - 1); y1 = np.minimum(y0 + 1, H - 1)
+    return ((img[y0, x0] * (1 - fx) + img[y0, x1] * fx) * (1 - fy)
+            + (img[y1, x0] * (1 - fx) + img[y1, x1] * fx) * fy)
+
+
+def _line_offset_px(normal, z_ref, f, b):
+    """
+    주점에서 이 선까지의 부호 있는 거리 [px] — 선 자신의 법선 방향으로.
+
+    깊이 Z 의 정면 평면과의 교선은 n_x·û + n_y·v̂ + (n_z + n_x·b/Z) = 0 이고,
+    화소 좌표로 옮기면 m̂·(p − c) = −(n_z + n_x·b/Z)·f/‖(n_x,n_y)‖ 다.
+    이 값의 인접 차이가 곧 **수직 방향 실제 선 간격** 이라, 추적 밴드를
+    여기서 뽑아야 한다. u 축 간격을 쓰면 굴린 격자에서 1/cos γ 배 넓게
+    잡혀(45° 에서 1.41배) 밴드가 옆 선을 물어 버린다.
+    """
+    n = np.asarray(normal, float)
+    lat = float(np.hypot(n[0], n[1]))
+    if lat < 1e-12:
+        return None
+    return -(n[2] + n[0] * b / float(z_ref)) * f / lat
+
+
+def _perp_spacings(lids, line_angles, z_ref, f, b, fallback):
+    """계열 안에서 선 사이의 수직 방향 간격 [px]."""
+    d = {}
+    for lid in lids:
+        nrm = (line_angles.get(lid) or {}).get("normal")
+        if nrm is None:
+            continue
+        off = _line_offset_px(nrm, z_ref, f, b)
+        if off is not None:
+            d[lid] = off
+    if len(d) < 2:
+        return {lid: fallback for lid in lids}
+    order = sorted(d, key=lambda k: d[k])
+    out = {}
+    for i, lid in enumerate(order):
+        gaps = []
+        if i > 0:
+            gaps.append(abs(d[lid] - d[order[i - 1]]))
+        if i < len(order) - 1:
+            gaps.append(abs(d[order[i + 1]] - d[lid]))
+        out[lid] = float(np.mean(gaps)) if gaps else fallback
+    for lid in lids:
+        out.setdefault(lid, fallback)
+    return out
+
+
+def _trace_line_oriented(diff, normal, z_ref, f, b, cx, cy, img_size,
+                         band=24.0, subpix_half=4, step=1.0,
+                         rel_frac=0.20, min_weight=2.0, miss_limit=40,
+                         max_offset=None):
+    """
+    선의 **자기 방향** 을 따라 걸으며 수직으로 훑는 추적기.
+
+    왜 따로 두는가
+    -------------
+    기존 _trace_line 은 행(또는 열)을 훑으며 한 축으로만 탐색한다. 선이
+    화면에서 세로/가로일 때는 그 축이 곧 법선 방향이라 최적이다. 그런데
+    격자를 굴리면 두 계열이 모두 대각선이 되어, 한 행에 V선과 H선이 함께
+    지나고 교점 근처에서는 몇 px 안으로 붙는다. 그러면 밴드 안에 옆 계열
+    능선이 들어와 추적이 옮겨 탄다(실측: 45° 굴림에서 14선 중 3선만 정상).
+
+    여기서는 선 방향 t̂ 로 걸으면서 **법선 방향 m̂ 으로만** 훑는다.
+    두 계열은 서로 직교하므로, m̂ 방향 밴드 안에 옆 계열 능선이 들어오는
+    구간은 교점 한 점뿐이고 그마저 폭이 좁아 무게중심에 거의 영향이 없다.
+
+    이미지를 돌리지 않는다는 점이 중요하다. 45° 회전 리샘플링은 화소
+    격자에 딱 떨어지지 않아 서브픽셀 위치에 계통 오차를 남긴다(이 저장소는
+    180° 뒤집기에서 같은 이유로 0.96px 오차를 겪었다). 여기서는 원본
+    화소만 겹선형으로 읽는다.
+
+    기하
+    ----
+    깊이 Z 의 정면 평면과 레이저 평면의 교선은 (û,v̂) 에서
+        n_x·û + n_y·v̂ + (n_z + n_x·b/Z) = 0
+    이므로 이미지에서 법선이 (n_x, n_y), 방향이 (−n_y, n_x) 인 직선이다.
+    """
+    H_img, W_img = img_size
+    n = np.asarray(normal, float)
+    lat = float(np.hypot(n[0], n[1]))
+    if lat < 1e-9:
+        return []
+    m_hat = np.array([n[0], n[1]]) / lat          # 이미지상 선의 법선
+    t_hat = np.array([-m_hat[1], m_hat[0]])       # 선 방향
+
+    # 예측선 위의 기준점 — 화면 중심에서 가장 가까운 점
+    K = n[2] + n[0] * b / float(z_ref)
+    # 화소 좌표계로 옮긴다: n_x(u−cx)/f + n_y(v−cy)/f + K = 0
+    #   → m·(p − c) = −K·f/lat   (c = 주점)
+    d0 = -K * f / lat
+    c = np.array([cx, cy])
+    p0 = c + m_hat * d0
+
+    # 화면을 가로지르는 s 구간
+    corners = np.array([[0, 0], [W_img - 1, 0], [0, H_img - 1],
+                        [W_img - 1, H_img - 1]], float)
+    sc = (corners - p0) @ t_hat
+    s_lo, s_hi = float(sc.min()), float(sc.max())
+
+    ws = np.arange(-float(band), float(band) + 1e-9, 1.0)
+    # 밴드 중심이 옆 선까지 흘러가지 못하게 묶어 둔다. 이 고삐가 없으면
+    # 표면이 끊긴 구간에서 옆 능선을 물고 그대로 따라가, 선 전체가
+    # 수백 px 옮겨 앉는다(실측: 45° 굴림에서 −662px).
+    off_cap = float(band) if max_offset is None else float(max_offset)
+    pts, offs = [], 0.0
+    ss, lit_w = [], []       # 걸음 위치와 그 자리에서 켜진 폭
+    miss = 0
+    s = s_lo
+    while s <= s_hi:
+        base = p0 + t_hat * s + m_hat * offs
+        px = base[0] + m_hat[0] * ws
+        py = base[1] + m_hat[1] * ws
+        inside = (px >= 0) & (px < W_img) & (py >= 0) & (py < H_img)
+        if inside.sum() < 5:
+            s += step
+            continue
+        prof = _sample_bilinear(diff, px, py)
+        prof = np.where(inside, prof, 0.0)
+        pk = int(np.argmax(prof))
+        hi = float(prof[pk])
+        bg = float(np.percentile(prof[inside], 8))
+        if hi - bg < min_weight:
+            miss += 1
+            if miss > miss_limit and pts:
+                break
+            s += step
+            continue
+        miss = 0
+        h = int(min(subpix_half, pk, len(prof) - 1 - pk))
+        if h < 1:
+            s += step
+            continue
+        win = prof[pk - h:pk + h + 1] - bg
+        np.clip(win, 0.0, None, out=win)
+        tot = float(win.sum())
+        if tot <= 0 or (hi - bg) * rel_frac <= 0:
+            s += step
+            continue
+        wl = ws[pk - h:pk + h + 1]
+        w_star = float((wl * win).sum() / tot)
+        q = base + m_hat * w_star
+        if 0 <= q[0] < W_img and 0 <= q[1] < H_img:
+            pts.append([float(q[0]), float(q[1])])
+            ss.append(s)
+            lit_w.append(int(np.count_nonzero(
+                prof[inside] > bg + rel_frac * (hi - bg))))
+            # 다음 걸음의 밴드 중심을 실제 위치 쪽으로 조금 끌어당긴다.
+            # 이득을 낮게 둔다 — 교점에서 무게중심이 튀는데, 이득이 크면
+            # 그 튐이 다음 걸음의 중심에 실려 누적된다.
+            offs = float(np.clip(offs + 0.10 * w_star, -off_cap, off_cap))
+        s += step
+
+    if len(pts) < 10:
+        return pts
+    P = np.asarray(pts, float)
+    sarr = np.asarray(ss, float)
+
+    # ── 교점 걸음 제거 ──
+    # 두 계열이 만나는 자리는 수직 프로파일이 넓게 뭉개져 무게중심이 튄다.
+    # 켜진 폭이 평소보다 넓은 걸음을 버린다 (_trace_line 과 같은 규칙).
+    w = np.asarray(lit_w, float)
+    wmed = float(np.median(w))
+    keep = w <= max(wmed * 2.0, wmed + 2.0)
+    if keep.sum() >= 10:
+        P, sarr = P[keep], sarr[keep]
+
+    # ── 선을 따라 3차 다항식으로 이상치 제거 ──
+    # 남은 튐은 옆 능선을 잠깐 문 자리다. 법선 방향 좌표가 s 에 대해
+    # 매끄럽게 변한다는 사실만 쓰므로 면이 휘어도 안전하다.
+    d_n = (P - c) @ m_hat
+    if len(P) >= 24:
+        t01 = (sarr - sarr.min()) / max(sarr.ptp() if hasattr(sarr, "ptp")
+                                        else np.ptp(sarr), 1e-9)
+        try:
+            co = np.polyfit(t01, d_n, 3)
+            r = d_n - np.polyval(co, t01)
+            mad = float(np.median(np.abs(r - np.median(r))))
+            thr = max(3.0 * 1.4826 * mad, 1.0)
+            good = np.abs(r - np.median(r)) <= thr
+            if good.sum() >= 10:
+                P = P[good]
+        except Exception:
+            pass
+    return P.tolist()
+
+
 def _trace_line(intensity_map, table, center_fallback,
                 band_base, band_max, axis, img_size, scan_range=None,
                 subpix_half=4):

@@ -611,3 +611,366 @@ if __name__ == "__main__":
                       base_image=scene["rgb_off"])
     print(f"\n  조서 → {p1}")
     print(f"  오버레이 → {p2}")
+
+
+# =====================================================================
+# 3D 점군 — 부재별로 어디에 점이 찍혔는가
+# =====================================================================
+def world_frame(g_hat, forward=(0.0, 0.0, 1.0)):
+    """
+    조사기 좌표계를 중력 정렬 좌표계로 바꾸는 정규직교 기저.
+
+    조사기 좌표(X 우, Y 하, Z 전방)를 그대로 그리면 장비를 숙인 각도만큼
+    장면 전체가 기울어 보인다. 검측 대상은 벽·바닥이라 "수직/수평이 눈에
+    보이는" 축이 아니면 그림을 읽을 수 없다.
+
+    Returns
+    -------
+    (3,3) — 열이 [right, fwd, up]. P_world = P_laser @ R
+    """
+    up = -np.asarray(g_hat, float)
+    up = up / np.linalg.norm(up)
+    fwd = np.asarray(forward, float)
+    fwd = fwd - up * float(fwd @ up)          # 수평면으로 정사영
+    nf = np.linalg.norm(fwd)
+    if nf < 1e-6:                              # 시선이 중력과 나란한 극단
+        fwd = np.array([0.0, 0.0, 1.0]) - up * float(up[2])
+        nf = np.linalg.norm(fwd)
+    fwd /= nf
+    right = np.cross(fwd, up)
+    right /= np.linalg.norm(right)
+    return np.column_stack([right, fwd, up])
+
+
+def _iso_project(P, az_deg=38.0, el_deg=24.0):
+    """등각 정사영. P 는 (N,3) [right, fwd, up]."""
+    a, e = np.radians(az_deg), np.radians(el_deg)
+    ca, sa, ce, se = np.cos(a), np.sin(a), np.cos(e), np.sin(e)
+    # 화면 가로 = 수평 회전, 화면 세로 = 높이 + 깊이의 기울기 성분
+    x = P[:, 0] * ca - P[:, 1] * sa
+    y = P[:, 2] * ce - (P[:, 0] * sa + P[:, 1] * ca) * se
+    depth = P[:, 0] * sa + P[:, 1] * ca       # 클수록 멀다 (먼저 그린다)
+    return x, y, depth
+
+
+def _panel_points(canvas, x, y, cols, box, pad, radius=1, sizes=None):
+    """
+    (x,y) 를 box 안에 등척(aspect 보존)으로 눌러 담아 canvas 에 찍는다.
+
+    numpy 로 직접 찍는다. 3만 점을 PIL ellipse 로 하나씩 그리면 느리고,
+    등척을 지키지 않으면 벽이 기울어 보여 그림이 거짓말을 한다.
+
+    Returns
+    -------
+    (scale, ox, oy) — 같은 변환으로 다른 것(요철 표시)을 얹기 위해
+    """
+    x0, y0, x1, y1 = box
+    w, h = (x1 - x0) - 2 * pad, (y1 - y0) - 2 * pad
+    if len(x) == 0 or w <= 0 or h <= 0:
+        return None
+    xmin, xmax = float(np.min(x)), float(np.max(x))
+    ymin, ymax = float(np.min(y)), float(np.max(y))
+    sx = w / max(xmax - xmin, 1e-6)
+    sy = h / max(ymax - ymin, 1e-6)
+    s = min(sx, sy)                            # 등척
+    ox = x0 + pad + (w - (xmax - xmin) * s) / 2.0 - xmin * s
+    oy = y1 - pad - (h - (ymax - ymin) * s) / 2.0 + ymin * s
+    px = np.rint(x * s + ox).astype(np.int64)
+    py = np.rint(-y * s + oy).astype(np.int64)
+    H, W = canvas.shape[:2]
+    r = int(radius)
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dx * dx + dy * dy > r * r + 1:
+                continue
+            qx, qy = px + dx, py + dy
+            ok = (qx >= x0) & (qx < x1) & (qy >= y0) & (qy < y1) \
+                & (qx >= 0) & (qx < W) & (qy >= 0) & (qy < H)
+            canvas[qy[ok], qx[ok]] = cols[ok]
+    return s, ox, oy
+
+
+def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
+                       max_points_per_region=40000, show_defects=True):
+    """
+    삼각측량으로 얻은 3D 점을 **부재별 색으로** 그린다.
+
+    왜 필요한가
+    ----------
+    검측 결과표는 "벽 수직도 0.03°" 같은 숫자만 준다. 그 숫자가 어느
+    점들에서 나왔는지, 부재가 제대로 갈렸는지, 점이 실제로 벽·바닥·동바리
+    모양으로 놓였는지는 3D 로 봐야 안다. 세그멘테이션 이미지는 화소 위에
+    찍은 그림이라 깊이가 안 보인다 — 바닥과 벽이 이미지에서는 붙어 있어도
+    3D 에서는 직각으로 갈라진다.
+
+    좌표계
+    ------
+    중력 정렬 좌표로 바꿔 그린다(world_frame). 가로=수평 좌우, 세로=높이,
+    깊이=장비에서 멀어지는 방향. 장비를 숙이고 찍었어도 벽은 수직으로,
+    바닥은 수평으로 보인다.
+
+    네 개 화면
+    ---------
+      등각    : 전체 배치를 한눈에
+      평면도  : 위에서 내려다본 배치 — 부재 사이 거리·가림이 보인다
+      정면도  : 카메라가 보는 방향 — 세그멘테이션 이미지와 대응된다
+      측면도  : 옆에서 — 벽이 정말 수직인지, 바닥이 수평인지
+
+    각 화면은 등척(같은 배율)이라 길이를 눈으로 비교할 수 있고, 축척
+    막대를 함께 그린다.
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    regs = [r for r in result.get("regions", [])
+            if r.get("point_xyz") is not None and len(r["point_xyz"])]
+    if not regs:
+        return None
+
+    R = world_frame(g_hat)
+    W, H = int(size[0]), int(size[1])
+    canvas = np.full((H, W, 3), 16, np.uint8)
+
+    # 부재별 점·색
+    Ps, Cs, counts = [], [], {}
+    for r in regs:
+        p = np.asarray(r["point_xyz"], float)
+        if len(p) > max_points_per_region:      # 그림만 성기게, 통계는 전부
+            idx = np.linspace(0, len(p) - 1, max_points_per_region).astype(int)
+            p = p[idx]
+        cls = r.get("class")
+        col = np.array(CLASS_COLOR.get(cls, (200, 200, 200)), np.uint8)
+        if r.get("status") != "measured":
+            col = (col.astype(float) * 0.45).astype(np.uint8)
+        Ps.append(p @ R)
+        Cs.append(np.repeat(col[None, :], len(p), axis=0))
+        counts[cls] = counts.get(cls, 0) + int(len(r["point_xyz"]))
+    P = np.vstack(Ps); C = np.vstack(Cs)
+
+    # 요철 3D 좌표 (있으면)
+    dpts, ddep = [], []
+    if show_defects:
+        for r in regs:
+            fl = r.get("flatness") or {}
+            for dd in (fl.get("defects") or []):
+                c3 = dd.get("center_xyz")
+                if c3 is not None:
+                    dpts.append(np.asarray(c3, float) @ R)
+                    ddep.append(float(dd.get("depth_mm", 0.0)))
+    D = np.array(dpts) if dpts else np.zeros((0, 3))
+
+    fs = max(15, H // 78)
+    font = _korean_font(fs)
+    ko = font is not None
+    im = Image.fromarray(canvas)
+    d0 = ImageDraw.Draw(im)
+
+    top = int(fs * 2.6)                         # 제목 줄
+    legend_h = int(fs * 1.9) * (len(counts) + (1 if len(D) else 0)) + fs * 2
+    body_h = H - top - legend_h
+    pw, ph = W // 2, body_h // 2
+    panels = [
+        ("등각", 0, 0), ("평면도 (위에서)", 1, 0),
+        ("정면도 (카메라 방향)", 0, 1), ("측면도 (옆에서)", 1, 1)]
+    panels_en = ["Isometric", "Top view", "Front view", "Side view"]
+
+    arr = np.asarray(im).copy()
+    boxes = {}
+    for k, (nm, gx, gy) in enumerate(panels):
+        x0 = gx * pw + 4; y0 = top + gy * ph + 4
+        x1 = x0 + pw - 8; y1 = y0 + ph - 8
+        boxes[k] = (x0, y0, x1, y1)
+        if k == 0:
+            px, py, dep = _iso_project(P)
+            o = np.argsort(-dep)                # 먼 점 먼저 (painter)
+            xs, ys, cc = px[o], py[o], C[o]
+            unit = "m"
+        else:
+            ax = {1: (0, 1), 2: (0, 2), 3: (1, 2)}[k]
+            xs, ys, cc = P[:, ax[0]], P[:, ax[1]], C
+            unit = "m"
+        tf = _panel_points(arr, xs, ys, cc, (x0, y0, x1, y1),
+                           pad=int(fs * 2.2), radius=1)
+        boxes[k] = ((x0, y0, x1, y1), tf)
+
+    im = Image.fromarray(arr)
+    d = ImageDraw.Draw(im)
+
+    def _txt(xy, s, fill=(235, 235, 235), f=None):
+        if ko:
+            d.text(xy, s, fill=fill, font=f or font)
+        else:
+            d.text(xy, s, fill=fill)
+
+    def _len(s, f=None):
+        return int(d.textlength(s, font=f or font)) if ko else len(s) * 6
+
+    ttl = title or ("3D 점군 — 부재별" if ko else "3D point cloud by member")
+    _txt((16, fs // 2), ttl)
+    sub = (f"중력 정렬 좌표 · 점 {len(P):,}개 · 등척"
+           if ko else f"gravity-aligned, {len(P)} pts, equal scale")
+    _txt((16 + _len(ttl) + fs, fs // 2 + 2), sub, fill=(150, 155, 165))
+
+    axis_ko = {0: ("가로", "높이"), 1: ("가로", "깊이"),
+               2: ("가로", "높이"), 3: ("깊이", "높이")}
+    axis_en = {0: ("right", "up"), 1: ("right", "fwd"),
+               2: ("right", "up"), 3: ("fwd", "up")}
+    for k, (nm, gx, gy) in enumerate(panels):
+        (x0, y0, x1, y1), tf = boxes[k]
+        d.rectangle([x0, y0, x1, y1], outline=(58, 62, 72))
+        _txt((x0 + 10, y0 + 6), nm if ko else panels_en[k], fill=(200, 205, 215))
+        ax = axis_ko[k] if ko else axis_en[k]
+        _txt((x1 - _len(ax[0]) - 12, y1 - fs - 8), ax[0], fill=(120, 126, 138))
+        _txt((x0 + 10, y0 + fs + 10), ax[1], fill=(120, 126, 138))
+        if tf is None:
+            continue
+        s, ox, oy = tf
+        # 축척 막대 — 1m 가 몇 화소인지. 없으면 크기를 알 수 없다.
+        for L in (1.0, 0.5, 0.2, 0.1):
+            if L * s < (x1 - x0) * 0.6:
+                break
+        bx, by = x0 + 14, y1 - 14
+        d.line([bx, by, bx + L * s, by], fill=(190, 195, 205), width=3)
+        for e in (bx, bx + L * s):
+            d.line([e, by - 5, e, by + 5], fill=(190, 195, 205), width=2)
+        lab = f"{L:g} m"
+        _txt((bx + L * s / 2 - _len(lab) / 2, by - fs - 8), lab,
+             fill=(190, 195, 205))
+        # 요철 위치
+        if len(D):
+            if k == 0:
+                dx, dy, _ = _iso_project(D)
+            else:
+                a2 = {1: (0, 1), 2: (0, 2), 3: (1, 2)}[k]
+                dx, dy = D[:, a2[0]], D[:, a2[1]]
+            for j in range(len(D)):
+                cxp, cyp = dx[j] * s + ox, -dy[j] * s + oy
+                if not (x0 < cxp < x1 and y0 < cyp < y1):
+                    continue
+                rr = max(9, W // 150)
+                d.ellipse([cxp - rr, cyp - rr, cxp + rr, cyp + rr],
+                          outline=DEFECT_COLOR, width=3)
+                d.line([cxp - rr * .5, cyp, cxp + rr * .5, cyp],
+                       fill=DEFECT_COLOR, width=2)
+                d.line([cxp, cyp - rr * .5, cxp, cyp + rr * .5],
+                       fill=DEFECT_COLOR, width=2)
+
+    # ── 범례 ──
+    y = H - legend_h + fs
+    _txt((16, y - fs - 2), "부재 구분" if ko else "members",
+         fill=(150, 155, 165))
+    for cls, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        col = CLASS_COLOR.get(cls, (200, 200, 200))
+        d.rectangle([16, y + 4, 16 + fs, y + fs], fill=col)
+        nm = (CLASS_KO.get(cls, cls) if ko else CLASS_EN.get(cls, cls))
+        _txt((16 + fs * 2, y), f"{nm}  ({cls}, {n:,}점)" if ko
+             else f"{nm} ({cls}, {n} pts)")
+        y += int(fs * 1.9)
+    if len(D):
+        d.ellipse([16, y + 3, 16 + fs, y + fs + 1], outline=DEFECT_COLOR,
+                  width=2)
+        mx = max(ddep) if ddep else 0.0
+        _txt((16 + fs * 2, y),
+             f"요철 {len(D)}곳 (최대 {mx:.1f}mm)" if ko
+             else f"defects: {len(D)} (max {mx:.1f}mm)", fill=DEFECT_COLOR)
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    im.save(path)
+    return path
+
+
+def region_xyz_rows(result, g_hat=None, stride=1):
+    """
+    부재별 3D 좌표를 표 한 장으로 편다 (엑셀·CSV 공용).
+
+    좌표를 두 벌 낸다.
+      조사기 좌표 (X,Y,Z) — 삼각측량이 직접 낸 값. 검측식이 쓴 그대로다.
+      중력 좌표 (가로,깊이,높이) — 사람이 읽을 수 있는 값.
+    중력 좌표의 원점은 **장비 광학중심** 이다. 높이가 음수면 장비보다
+    아래라는 뜻이고, 절대 표고가 아니다. 표고로 바꾸려면 장비 설치 높이를
+    더해야 한다 — 그 값은 이 장비가 알 수 없다.
+    g_hat 이 없으면 중력 좌표는 비운다.
+
+    stride 로 솎아 낸다. 3만 점을 그대로 시트에 넣으면 파일이 무거워지고
+    사람이 읽지도 않는다. 통계(요약 행)는 항상 **전체 점**으로 낸다.
+    """
+    R = world_frame(g_hat) if g_hat is not None else None
+    rows = []
+    for i, r in enumerate(result.get("regions", [])):
+        p = r.get("point_xyz")
+        if p is None or not len(p):
+            continue
+        P = np.asarray(p, float)
+        lid = r.get("point_lid")
+        Pw = P @ R if R is not None else None
+        for j in range(0, len(P), max(1, int(stride))):
+            row = {"부재번호": i + 1, "클래스": r.get("class"),
+                   "판정대상": r.get("kind"),
+                   "선ID": (str(lid[j]) if lid is not None and j < len(lid)
+                            else None),
+                   "X_m": round(float(P[j, 0]), 5),
+                   "Y_m": round(float(P[j, 1]), 5),
+                   "Z_m": round(float(P[j, 2]), 5)}
+            if Pw is not None:
+                row.update({"가로_m": round(float(Pw[j, 0]), 5),
+                            "깊이_m": round(float(Pw[j, 1]), 5),
+                            "높이_m": round(float(Pw[j, 2]), 5)})
+            rows.append(row)
+    return rows
+
+
+def region_xyz_summary(result, g_hat=None):
+    """부재별 3D 요약 — 점수, 중심, 크기(외접 상자), 깊이 범위."""
+    R = world_frame(g_hat) if g_hat is not None else None
+    out = []
+    for i, r in enumerate(result.get("regions", [])):
+        p = r.get("point_xyz")
+        if p is None or not len(p):
+            continue
+        P = np.asarray(p, float)
+        Pw = P @ R if R is not None else P
+        lid = r.get("point_lid")
+        fams = {}
+        if lid is not None:
+            for l in np.unique(np.asarray(lid, dtype=object)):
+                fams[str(l)[0]] = fams.get(str(l)[0], 0) + int(
+                    np.sum(np.asarray(lid, dtype=object) == l))
+        rec = {
+            "부재번호": i + 1, "클래스": r.get("class"),
+            "검측": r.get("kind"), "상태": r.get("status"),
+            "점수": int(len(P)),
+            "선구성": (" / ".join(f"{k} {v:,}점" for k, v in sorted(fams.items()))
+                    or None),
+            "깊이이득_RMS": r.get("depth_gain_rms"),
+            "중심_X_m": round(float(P[:, 0].mean()), 4),
+            "중심_Y_m": round(float(P[:, 1].mean()), 4),
+            "중심_Z_m": round(float(P[:, 2].mean()), 4),
+            "거리범위_m": [round(float(P[:, 2].min()), 3),
+                       round(float(P[:, 2].max()), 3)],
+        }
+        if R is not None:
+            # numpy 2.0 에서 ndarray.ptp() 가 없어졌다. np.ptp 를 쓴다.
+            rec.update({
+                "가로폭_m": round(float(np.ptp(Pw[:, 0])), 4),
+                "깊이폭_m": round(float(np.ptp(Pw[:, 1])), 4),
+                "높이폭_m": round(float(np.ptp(Pw[:, 2])), 4),
+                "높이범위_m": [round(float(Pw[:, 2].min()), 3),
+                           round(float(Pw[:, 2].max()), 3)]})
+        out.append(rec)
+    return out
+
+
+def save_pointcloud_csv(path, result, g_hat=None, stride=1):
+    """부재별 3D 좌표를 CSV 로. CAD·측량 소프트로 그대로 넘어간다."""
+    import csv
+    rows = region_xyz_rows(result, g_hat=g_hat, stride=stride)
+    if not rows:
+        return None
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8-sig") as fp:
+        wr = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
+        wr.writeheader()
+        wr.writerows(rows)
+    return path

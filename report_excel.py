@@ -243,8 +243,48 @@ def _sheet_detection(wb, openpyxl, det, e2e=None, tri=None):
         ("V선 번호 일치", f"{det['id_ok']['V'][0]} / {det['id_ok']['V'][1]}", "",
          "선 번호가 발사각 α 를 정한다 — 틀리면 깊이가 통째로 어긋난다"),
         ("H선 번호 일치", f"{det['id_ok']['H'][0]} / {det['id_ok']['H'][1]}", "",
-         "H선은 삼각측량에 쓰지 않으므로 측정에는 영향 없음"),
+         "가로선 번호. 아래 계열별 표에서 깊이 기여를 따로 본다"),
         ("", "", "", ""),
+    ]
+
+    # ── 계열별 (세로 V / 가로 H) ──
+    # 검출이 잘 되는가와 깊이를 줄 수 있는가는 별개 문제다. 가로선은
+    # 완벽하게 검출되면서도 깊이는 하나도 못 줄 수 있고, 그 원인은
+    # 검출이 아니라 기하(eq7 의 이득 g)에 있다. 둘을 한 표에 나란히
+    # 놓아야 "가로축을 왜 못 쓰는가" 가 조서에서 읽힌다.
+    fam = det.get("families") or {}
+    if fam:
+        rows += [("[계열별] 세로선 vs 가로선", "", "",
+                  "검출 정확도와 깊이 기여를 나눠 본다")]
+        for pre, d in fam.items():
+            gm = d["깊이이득_중앙"]
+            sw = d["정답선_변동폭_px"]
+            usable = d["깊이가능"]
+            rows.append((
+                f"{d['이름']} 검출",
+                f"{d['검출']} / {d['선 수']}",
+                "",
+                (f"{d['측정축']} 좌표 기준. 선내잡음 {d['선내잡음_px']} px "
+                 f"+ 선간편차 {d['선간편차_px']} px → 통합 {d['통합오차_px']} px")))
+            rows.append((
+                f"{d['이름']} 깊이 신호",
+                (f"{sw:.4f} px" if sw is not None else "-"),
+                "",
+                ("정답선이 측정축으로 실제 움직이는 폭. 이 폭이 검출 잡음보다 "
+                 "작으면 깊이를 읽어낼 것이 없다")))
+            rows.append((
+                f"{d['이름']} 깊이 사용",
+                f"{usable} / {d['선 수']}",
+                "",
+                (f"레이저 평면 이득 g ≈ {gm} (기준 g ≤ "
+                 f"{det.get('max_depth_gain', 3.0):g})"
+                 if gm is not None else
+                 "g = ∞ — 레이저 평면이 기선(X축)을 품어 시차가 선과 나란하다. "
+                 "검출을 아무리 잘해도 깊이가 안 풀린다. 격자를 광축 둘레로 "
+                 "굴려야(roll) 풀린다 — calibration 의 diagonal 프로파일 참조")))
+        rows += [("", "", "", "")]
+
+    rows += [
         ("[화소 오차] 무엇을 뺐나", "검출 u − 정답 u", "",
          "같은 행(v)에서 선검출이 찾은 u 와 raycast 정답 u 의 차이. "
          "깊이가 아니라 화면 좌표 차이다"),
@@ -529,9 +569,100 @@ def _sheet_caveats(wb, openpyxl, record, extra=None):
 # =====================================================================
 # 진입점
 # =====================================================================
+def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
+    """
+    3D 좌표 — 부재별로 점이 어디에 찍혔는가 (요약).
+
+    검측표는 "벽 수직도 0.03°" 같은 숫자만 준다. 그 숫자가 어느 점들에서
+    나왔는지, 부재가 제대로 갈렸는지는 3D 배치를 봐야 안다. 여기에는
+    부재별 점 수·중심·크기·거리 범위를 싣고, 좌표 원본은 다음 시트와
+    CSV 로 낸다.
+    """
+    ws = wb.create_sheet("9.3D좌표(부재별)")
+    rows = REPORT.region_xyz_summary(result, g_hat=g_hat)
+    ws.append(["부재", "클래스", "검측", "상태", "점 수", "선 구성",
+               "깊이이득", "중심 X(m)", "중심 Y(m)", "중심 Z(m)",
+               "거리범위(m)", "가로폭(m)", "깊이폭(m)", "높이폭(m)"])
+    for r in rows:
+        ws.append([
+            r["부재번호"], r["클래스"], r["검측"], r["상태"], r["점수"],
+            r.get("선구성"), r.get("깊이이득_RMS"),
+            r["중심_X_m"], r["중심_Y_m"], r["중심_Z_m"],
+            f"{r['거리범위_m'][0]} ~ {r['거리범위_m'][1]}",
+            r.get("가로폭_m"), r.get("깊이폭_m"), r.get("높이폭_m")])
+    if not rows:
+        ws.append(["3D 점이 없다 — 삼각측량 단계를 확인할 것"])
+    _style(ws, openpyxl,
+           widths=[7, 14, 14, 10, 10, 20, 10, 12, 12, 12, 18, 12, 12, 12])
+
+    n = ws.max_row + 2
+    ws.cell(row=n, column=1, value="좌표계 설명").font = \
+        openpyxl.styles.Font(bold=True)
+    for i, t in enumerate([
+        "X·Y·Z 는 조사기(레이저 원점) 좌표다. X=오른쪽, Y=아래, Z=정면 거리. "
+        "eq1·eq7 삼각측량이 직접 낸 값이며 검측식이 쓴 것과 같은 배열이다.",
+        "가로폭·깊이폭·높이폭은 중력 정렬 좌표에서 잰 외접 상자 크기다. "
+        "장비를 숙이고 찍어도 벽은 수직, 바닥은 수평으로 서게 돌려 놓은 축이다.",
+        "높이의 원점은 장비 광학중심이다. 절대 표고가 아니므로 표고로 바꾸려면 "
+        "장비 설치 높이를 더해야 한다 — 그 값은 이 장비가 알 수 없다.",
+        "선 구성은 그 부재의 점이 V선(세로)·H선(가로) 중 어디서 왔는지다. "
+        "가로선이 깊이를 못 주는 사양에서는 V 만 나온다.",
+    ]):
+        ws.cell(row=n + 1 + i, column=1, value=t)
+        ws.merge_cells(start_row=n + 1 + i, start_column=1,
+                       end_row=n + 1 + i, end_column=14)
+    if image_path and _os.path.exists(image_path):
+        try:
+            from openpyxl.drawing.image import Image as XLImage
+            img = XLImage(image_path)
+            sc = min(1.0, 1100.0 / float(img.width))
+            img.width = int(img.width * sc); img.height = int(img.height * sc)
+            ws.add_image(img, f"A{n + 6}")
+        except Exception:
+            pass
+    return ws
+
+
+def _sheet_pointcloud_xyz(wb, openpyxl, result, g_hat=None, stride=20,
+                          max_rows=50000):
+    """
+    3D 좌표 원본 — 부재 구분이 붙은 점 목록.
+
+    stride 로 솎아 낸다. 3만 점을 그대로 넣으면 파일이 무거워지고 사람이
+    읽지도 않는다. 전체 좌표는 같은 폴더의 CSV 에 있고, 앞 시트의 요약
+    통계는 언제나 **전체 점** 으로 낸 값이다.
+    """
+    ws = wb.create_sheet("10.3D좌표(점목록)")
+    rows = REPORT.region_xyz_rows(result, g_hat=g_hat, stride=stride)
+    if len(rows) > max_rows:
+        rows = rows[:max_rows]
+        trimmed = True
+    else:
+        trimmed = False
+    if not rows:
+        ws.append(["3D 점이 없다"])
+        _style(ws, openpyxl, widths=[40])
+        return ws
+    cols = list(rows[0].keys())
+    ws.append(cols)
+    for r in rows:
+        ws.append([r.get(c) for c in cols])
+    _style(ws, openpyxl, widths=[9, 13, 15, 8] + [11] * (len(cols) - 4))
+    n = ws.max_row + 2
+    note = (f"{stride}개마다 한 점씩 실었다. 전체 좌표는 같은 폴더의 "
+            f"_3D좌표.csv 에 있다.")
+    if trimmed:
+        note += f" 시트 상한 {max_rows:,}행에서 잘랐다."
+    ws.cell(row=n, column=1, value=note)
+    ws.merge_cells(start_row=n, start_column=1, end_row=n,
+                   end_column=len(cols))
+    return ws
+
+
 def save_excel(path, result, meta=None, label_pixels=None,
                extra_caveats=None, seg_image_path=None, detection=None,
-               end_to_end=None, triangulation=None):
+               end_to_end=None, triangulation=None, g_hat=None,
+               pointcloud_image=None, pc_stride=20):
     """
     검측 결과를 엑셀 조서로 저장한다.
 
@@ -542,6 +673,10 @@ def save_excel(path, result, meta=None, label_pixels=None,
     label_pixels : {class: 화소수} — 세그멘테이션 마스크 면적 (선택)
     seg_image_path : 세그멘테이션 결과 이미지 경로 — 4번 시트에 삽입
     detection    : load_capture.evaluate_line_detection 결과 (선택)
+    g_hat        : (3,) 조사기 좌표계 중력. 주면 3D 좌표 시트가 중력 정렬
+                   좌표(가로·깊이·높이)를 함께 낸다
+    pointcloud_image : 3D 점군 이미지 경로 — 9번 시트에 삽입
+    pc_stride    : 3D 점목록 시트에 N개마다 한 점 (기본 20)
     """
     import openpyxl
     record = REPORT.build_record(result, meta)
@@ -555,6 +690,9 @@ def save_excel(path, result, meta=None, label_pixels=None,
     _sheet_flatness(wb, openpyxl, result)
     _sheet_defects(wb, openpyxl, result, seg_image_path)
     _sheet_caveats(wb, openpyxl, record, extra_caveats)
+    _sheet_pointcloud(wb, openpyxl, result, g_hat=g_hat,
+                      image_path=pointcloud_image)
+    _sheet_pointcloud_xyz(wb, openpyxl, result, g_hat=g_hat, stride=pc_stride)
     d = _os.path.dirname(_os.path.abspath(path))
     if d:
         _os.makedirs(d, exist_ok=True)

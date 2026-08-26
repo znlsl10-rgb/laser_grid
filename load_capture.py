@@ -53,6 +53,7 @@ def _load(name):
 CALIB = _load("calibration")
 PIPE = _load("pipeline_region")
 DETECT = _load("A_선검출")
+_EQ7 = _load("eq7_laser_plane")
 
 # 검출선과 정답선을 같은 선으로 볼 최대 거리 [px].
 # 이 사양의 격자 간격은 화면에서 45~55px 이므로, 5px 이면 이웃 선과
@@ -116,9 +117,14 @@ def load_folder(path, world_up=(0.0, 0.0, 1.0), stride=1):
     cy = float(cp_raw["camera"]["cy_px"])
     b = float(cp_raw["baseline_m"])
 
-    # ── V선만 모은다 (위 주석 참조) ──
+    # ── V선·H선을 모두 모은다 ──
+    # 예전에는 V선만 실었다. 근거는 "H선은 깊이가 안 풀린다" 였는데, 그
+    # 판단을 여기서 내리면 H선이 실제로 어떤 상태인지 조서에 남지 않는다.
+    # 전부 싣고, 깊이에 쓸지 말지는 eq7 의 이득 g 가 데이터로 판정하게 한다
+    # (triangulate_lines 가 g=∞ 인 선을 사유와 함께 걸러낸다).
     lines_pixels, line_angles, P_all, uv_all = {}, {}, [], []
     n_h = 0
+    line_world = {}
     for lid, ln in cast.items():
         pts = ln["points"][::stride]
         uv = np.array([[p["uv"][0] * su, p["uv"][1] * sv] for p in pts])
@@ -126,10 +132,11 @@ def load_folder(path, world_up=(0.0, 0.0, 1.0), stride=1):
         P_all.append(P); uv_all.append(uv)          # 자세 적합엔 V·H 모두 쓴다
         if ln["fixed"] != "alpha":
             n_h += 1
-            continue
         lines_pixels[lid] = uv
-        line_angles[lid] = {"fixed": "alpha",
-                            "angle_rad": float(np.radians(ln["angle_deg"]))}
+        line_world[lid] = P
+        line_angles[lid] = {
+            "fixed": ln["fixed"],
+            "angle_rad": float(np.radians(ln["angle_deg"]))}
     P_all = np.concatenate(P_all); uv_all = np.concatenate(uv_all)
 
     rt = cp_raw.get("rig_transform") or {}
@@ -184,6 +191,29 @@ def load_folder(path, world_up=(0.0, 0.0, 1.0), stride=1):
                            "data_deg": float(np.degrees(
                                a if ln["fixed"] == "alpha" else bta))}
 
+    # ── 선마다 레이저 평면을 **데이터에서** 맞춘다 ──
+    # 발사각 하나로 평면을 세우면 "V평면은 Y축을 품는다" 같은 가정이 따라
+    # 들어온다. raycast 점은 정의상 그 평면 위에 있으므로, 레이저 원점을
+    # 지나는 평면을 직접 맞추면 가정 없이 법선이 나온다. 격자를 굴려서
+    # 오든 비스듬히 오든 같은 코드가 받는다.
+    #
+    #   Pl = (P_world − L) @ R  (조사기 좌표계) → SVD 최소 특이벡터 = 법선
+    #
+    # 이렇게 얻은 법선의 n_x 가 0 이면 그 선은 원리적으로 깊이가 없다.
+    # 이 표본의 H선이 정확히 그 경우이고, 가정이 아니라 측정으로 확인된다.
+    for lid, P in line_world.items():
+        Pl = (P - L) @ R
+        # 원점을 지나는 평면이므로 중심화하지 않는다(중심화하면 원점
+        # 통과 제약이 풀려 다른 평면이 나온다).
+        _, sv_, Vt = np.linalg.svd(Pl, full_matrices=False)
+        n = Vt[-1]
+        n = n / np.linalg.norm(n)
+        resid_mm = float(np.max(np.abs(Pl @ n))) * 1000.0
+        info = line_angles[lid]
+        info["normal"] = n.tolist()
+        info["depth_gain"] = _EQ7.depth_gain(n)
+        info["plane_resid_mm"] = round(resid_mm, 4)
+
     camera_params = {"f_px": f, "b_m": b, "cx_px": cx, "cy_px": cy,
                      "resolution": [SW, SH]}
     diag = {
@@ -193,8 +223,8 @@ def load_folder(path, world_up=(0.0, 0.0, 1.0), stride=1):
         "기선 벡터(카메라좌표, m)": [round(x, 4) for x in t_cam],
         "기선 x성분 대비 잔여(mm)": round(
             float(np.hypot(t_cam[1], t_cam[2])) * 1000, 1),
-        "V선 수": len(lines_pixels), "H선 수": n_h,
-        "V선 점 수": int(sum(len(v) for v in lines_pixels.values())),
+        "V선 수": len(lines_pixels) - n_h, "H선 수": n_h,
+        "격자점 수(V+H)": int(sum(len(v) for v in lines_pixels.values())),
         "중력(조사기좌표)": [round(x, 4) for x in g_hat],
         "장비 하향각(°)": round(float(np.degrees(np.arctan2(
             g_hat[2], g_hat[1]))), 2),
@@ -396,6 +426,66 @@ def evaluate_line_detection(path, cap, image_name="CAST.png"):
     ok = [r for r in v_rows if r["err_rms"] is not None]
     missed = [r for r in v_rows if r["err_rms"] is None]
 
+    # ── 계열별(V 세로 / H 가로) 검출 성적 ──
+    # 예전에는 V선만 집계했다. 가로선은 추적까지 해 놓고 성적을 아무 데도
+    # 남기지 않아, "가로축이 검출되고 있는가" 를 조서에서 확인할 방법이
+    # 없었다. 검출 정확도(화소)와 깊이 기여(이득 g)는 별개의 문제이므로
+    # 둘을 같이 싣는다 — 가로선은 잘 찾아도 깊이를 못 줄 수 있고, 그
+    # 이유는 검출이 아니라 기하에 있다.
+    la = cap.get("line_angles", {})
+    families = {}
+    for pre, fx, nm, axis_nm in (("V", "alpha", "V선(세로)", "u"),
+                                 ("H", "beta", "H선(가로)", "v")):
+        fr = [r for r in rows if r["fixed"] == fx]
+        if not fr:
+            continue
+        fok = [r for r in fr if r["err_rms"] is not None]
+        e_all = [r["err_med"] for r in fok]
+        n_all = [r["err_noise"] for r in fok]
+        gains = [la[r["lid"]]["depth_gain"] for r in fr
+                 if r["lid"] in la and "depth_gain" in la[r["lid"]]]
+        gfin = [g for g in gains if np.isfinite(g) and g < 1e6]
+        # 정답선 자체가 그 축으로 얼마나 움직이는가 = 그 선이 담고 있는
+        # 깊이 신호의 크기. 검출 잡음보다 작으면 원리적으로 못 쓴다.
+        swing = []
+        for r in fr:
+            ln = cast.get(r["lid"])
+            if ln:
+                a = np.array([p["uv"][0 if fx == "alpha" else 1]
+                              for p in ln["points"]], float)
+                swing.append(float(a.max() - a.min()))
+        # 오차를 세 갈래로 나눈다. 셋은 원인도 대책도 다르다.
+        #   계통편차   : 모든 선이 같은 방향으로 밀린 양. 좌표 규약·주점·
+        #                기선이 어긋난 것이며 소프트웨어로 없앨 수 있다.
+        #   선간편차   : 선마다 밀린 양이 서로 다른 산포. 발사각 α_i 모델이
+        #                실제 DOE 와 다른 것이 주원인 — 출고 캘리브레이션으로
+        #                실측 α_i 를 넣으면 준다.
+        #   선내잡음   : 한 선을 따라가며 생기는 산포. 이것이 진짜 서브픽셀
+        #                검출 정밀도이고, 렌더 양자화가 하한을 만든다.
+        # 통합 σ 는 셋이 섞인 값이라, 어디를 고쳐야 하는지는 이 분해를
+        # 봐야 알 수 있다.
+        pooled = None
+        if fok:
+            ev = [r for r in fok]
+            pooled = float(np.sqrt(np.mean(
+                [r["err_noise"] ** 2 + (r["err_med"] - np.median(e_all)) ** 2
+                 for r in ev])))
+        families[pre] = {
+            "이름": nm, "측정축": axis_nm,
+            "선 수": len(fr), "검출": len(fok),
+            "미검출": [r["lid"] for r in fr if r["err_rms"] is None],
+            "계통편차_px": (round(float(np.median(e_all)), 4) if e_all else None),
+            "선간편차_px": (round(float(np.std(e_all)), 4)
+                        if len(e_all) > 1 else None),
+            "선내잡음_px": (round(float(np.median(n_all)), 4) if n_all else None),
+            "통합오차_px": (round(pooled, 4) if pooled is not None else None),
+            "정답선_변동폭_px": (round(float(np.median(swing)), 4)
+                            if swing else None),
+            "깊이이득_중앙": (round(float(np.median(gfin)), 3) if gfin else None),
+            "깊이가능": sum(1 for g in gains
+                         if np.isfinite(g) and g <= _EQ7.MAX_DEPTH_GAIN),
+        }
+
     # 화소 오차를 깊이 오차로 환산 — 이 숫자가 최종 정확도를 좌우한다.
     #   dZ = Z²/(f·b) · du       (센서 화소 기준)
     f_sensor = float(cp_raw["camera"]["f_px"])
@@ -433,6 +523,8 @@ def evaluate_line_detection(path, cap, image_name="CAST.png"):
         "dz_med_mm": _agg(v_rows, "dz_med_mm"),
         "dz_noise_mm": _agg(v_rows, "dz_noise_mm"),
         "dz_p95_mm": _agg(v_rows, "dz_p95_mm"),
+        "families": families,
+        "max_depth_gain": _EQ7.MAX_DEPTH_GAIN,
     }
 
 
@@ -763,11 +855,12 @@ def evaluate_end_to_end(path, cap, det, backend="geom", sigma_u_px=None):
     su_px = CALIB.SIGMA_U_PX if sigma_u_px is None else float(sigma_u_px)
     out = {}
     for tag, lp in (("gt", cap["lines_pixels"]), ("det", lines_det)):
-        xyz, uv, _ = PIPE.triangulate_lines(lp, cap["line_angles"], cp)
+        xyz, uv, ti = PIPE.triangulate_lines(lp, cap["line_angles"], cp)
         if not xyz:
             return None
         r = PIPE.inspect_image(uv, xyz, cp, cap["g_hat"],
-                              seg_backend=backend, sigma_u_px=su_px)
+                              seg_backend=backend, sigma_u_px=su_px,
+                              line_gain=ti["line_gain"])
         best = {}
         for reg in r["regions"]:
             if reg["status"] != "measured":
@@ -804,7 +897,7 @@ def evaluate_end_to_end(path, cap, det, backend="geom", sigma_u_px=None):
 # 검측 실행
 # =====================================================================
 def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
-                   sigma_u_px=None, eval_detection=True):
+                   sigma_u_px=None, eval_detection=True, pc_stride=20):
     name = os.path.basename(os.path.normpath(path))
     cap = load_folder(path, stride=stride)
     cp = cap["camera_params"]
@@ -824,10 +917,18 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
         print(f"  {'삼각측량 자체 검증':<24}정답 화소 → 3D 오차 중앙 "
               f"{tri['dist_med_mm']:.4f}mm (최대 {tri['dist_max_mm']:.3f}mm)")
 
-    lines_xyz, lines_uv, skipped = PIPE.triangulate_lines(
+    lines_xyz, lines_uv, tri_info = PIPE.triangulate_lines(
         cap["lines_pixels"], cap["line_angles"], cp)
     n3d = sum(len(v) for v in lines_xyz.values())
-    print(f"  {'삼각측량 성공 점':<24}{n3d}")
+    nf = tri_info["n_by_family"]
+    print(f"  {'삼각측량 성공 점':<24}{n3d}"
+          f"   (V {nf.get('V', 0)} + H {nf.get('H', 0)})")
+    for fam, d in tri_info["family"].items():
+        gm = d["이득_중앙"]
+        print(f"  {'  ' + d['이름']:<24}"
+              f"{d['선 수']}개 중 깊이가능 {d['깊이가능']}개"
+              + (f"   이득 g 중앙 {gm}" if gm is not None else "")
+              + (f"   g=∞ {d['무한대']}개" if d["무한대"] else ""))
     if n3d == 0:
         print("  [중단] 삼각측량된 점이 없다.")
         return None
@@ -861,6 +962,16 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
             print(f"    무작위 오차 σ_u   {det_eval['err_noise_px']:.3f} px  "
                   f"→ 깊이 {det_eval['depth_noise_mm']:.1f} mm  "
                   f"(설계 가정 {det_eval['sigma_u_design_px']} px)")
+            for pre, d in (det_eval.get("families") or {}).items():
+                sw, gm = d["정답선_변동폭_px"], d["깊이이득_중앙"]
+                print(f"    {d['이름']:<12}검출 {d['검출']}/{d['선 수']}"
+                      f"   선내잡음 {d['선내잡음_px']} px"
+                      f" / 선간편차 {d['선간편차_px']} px"
+                      f" → 통합 {d['통합오차_px']} px")
+                print(f"    {'':<12}깊이 신호(정답선 {d['측정축']} 변동폭) "
+                      f"{sw if sw is not None else '-'} px"
+                      f"   깊이가능 {d['깊이가능']}/{d['선 수']}"
+                      + (f" (g≈{gm})" if gm is not None else " (g=∞ — 원리적 불가)"))
 
     # 불확실도에 **측정한** 선검출 오차를 넣는다.
     # 설계 가정 0.2px 를 그대로 쓰면, 실제 검출이 그보다 나쁠 때 평활도를
@@ -877,7 +988,9 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
                   f"(설계 가정 {CALIB.SIGMA_U_PX}px)")
 
     res = PIPE.inspect_image(lines_uv, lines_xyz, cp, cap["g_hat"],
-                             seg_backend=backend, sigma_u_px=su)
+                             seg_backend=backend, sigma_u_px=su,
+                             line_gain=tri_info["line_gain"])
+    res["triangulation"] = tri_info
     print()
     print(PIPE.format_report(res))
 
@@ -893,6 +1006,20 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
                                    res, base_image=base,
                                    shape=(cp["resolution"][1], cp["resolution"][0]),
                                    uv_transform=uv_tf)
+    # ── 3D 점군 — 부재별로 어디에 점이 찍혔는가 ──
+    # 세그멘테이션 이미지는 화소 위 그림이라 깊이가 안 보인다. 벽과 바닥이
+    # 사진에서는 붙어 있어도 3D 에서는 직각으로 갈라지고, 그게 맞게 갈렸는지가
+    # 곧 검측이 맞았는지다.
+    pc3d = pc_csv = None
+    try:
+        pc3d = REPORT.save_pointcloud_3d(
+            os.path.join(out_dir, f"{name}_3D점군.png"), res, cap["g_hat"],
+            title=f"3D 점군 — {name}")
+        pc_csv = REPORT.save_pointcloud_csv(
+            os.path.join(out_dir, f"{name}_3D좌표.csv"), res,
+            g_hat=cap["g_hat"], stride=max(1, int(pc_stride)))
+    except Exception as e:
+        print(f"  [경고] 3D 점군 산출 실패: {e}")
     meta = {"현장": site or "-", "입력 폴더": name,
             "케이스": cap["meta"].get("case"),
             "촬영 시각": cap["meta"].get("captured_at")}
@@ -949,13 +1076,20 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
     xl = XLS.save_excel(os.path.join(out_dir, f"{name}_품질검측조서.xlsx"), res,
                         meta=meta, seg_image_path=seg, extra_caveats=caveats,
                         detection=det_eval, end_to_end=e2e,
-                        triangulation=tri)
+                        triangulation=tri, g_hat=cap["g_hat"],
+                        pointcloud_image=pc3d,
+                        pc_stride=max(1, int(pc_stride)))
     print()
     if ov:
         print(f"  선검출 대조 이미지: {ov}")
     print(f"  세그멘테이션 이미지: {seg}")
+    if pc3d:
+        print(f"  3D 점군 이미지:     {pc3d}")
+    if pc_csv:
+        print(f"  3D 좌표 CSV:       {pc_csv}")
     print(f"  엑셀 조서:          {xl}")
     return {"result": res, "capture": cap, "seg": seg, "xlsx": xl,
+            "pointcloud": pc3d, "pointcloud_csv": pc_csv,
             "name": name, "out_dir": out_dir}
 
 
@@ -981,6 +1115,9 @@ def main():
                     help="선검출 픽셀오차 가정 [px]. 기본은 프로파일 값")
     ap.add_argument("--no-detect-eval", action="store_true",
                     help="선검출 정확도 대조를 건너뛴다 (느릴 때)")
+    ap.add_argument("--pc-stride", type=int, default=20,
+                    help="3D 좌표 CSV·엑셀에 N개마다 한 점 (기본 20). "
+                         "그림과 요약 통계는 항상 전체 점을 쓴다")
     ap.add_argument("--profile", default=None)
     a = ap.parse_args()
     if a.profile:
@@ -996,7 +1133,7 @@ def main():
     for t in targets:
         out = (os.path.join(a.out, os.path.basename(os.path.normpath(t)))
                if a.out else None)
-        inspect_folder(t, out_dir=out, backend=a.backend,
+        inspect_folder(t, out_dir=out, backend=a.backend, pc_stride=a.pc_stride,
                        stride=a.stride, site=a.site, sigma_u_px=a.sigma_u,
                        eval_detection=not a.no_detect_eval)
         print()
