@@ -159,25 +159,259 @@ def resolve_single_plane_members(result, rgb, camera_params, g_hat,
         r["silhouette"] = res
         if not res.get("ok"):
             continue
-        th_plane = float(r.get("theta_deg") or 0.0)
-        th_edge = float(res["theta_deg"])
-        th = float(np.hypot(th_plane, th_edge))
-        r["theta_deg_plane_only"] = round(th_plane, 4)
-        r["theta_deg_lateral"] = round(th_edge, 4)
-        r["theta_deg"] = round(th, 4)
-        r["single_plane"] = False
-        kcs = _EQ5.KCS_CLASS.get(r["class"], r["class"])
-        j = _EQ3.judge_kcs(th, kcs, member_length_m=None)
-        j["resolved_by"] = "가림 그림자 실루엣 (eq8)"
-        j["note"] = (
-            f"세로선 한 줄로는 레이저 평면 안 성분({th_plane:.4f}°)밖에 못 "
-            f"쟀다. 부재가 배경에 드리운 그림자에서 실루엣 가장자리를 "
-            f"{res['n_points']}개 높이에서 찾아(예측 폭 "
-            f"{res['shadow']['expected_width_px']}px) 평면에 수직인 성분 "
-            f"{th_edge:.4f}° 를 되찾았고, 둘을 제곱합으로 합쳐 {th:.4f}° 다. "
-            f"가장자리 직선 잔차 {res['rms_px']}px, 세로 구간 "
-            f"{res['span_m']}m.")
-        r["judge"] = j
+        detail = (f"부재가 배경에 드리운 그림자에서 실루엣 가장자리를 "
+                  f"{res['n_points']}개 높이에서 찾아(예측 폭 "
+                  f"{res['shadow']['expected_width_px']}px)")
+        _apply_lateral(r, res, "가림 그림자 실루엣 (eq8)", detail)
+        n_ok += 1
+    return n_ok
+
+
+def _apply_lateral(r, res, resolved_by, detail):
+    """
+    되찾은 **평면수직 성분**을 이미 있는 평면안 성분과 합쳐 판정을 고친다.
+
+    두 성분은 서로 직교한다 — 세로선은 레이저 평면 안, 이쪽 단서는 그
+    평면에 수직인 방향(등깊이면)에서 잰다. 작은 각도에서 제곱합이다.
+
+        θ_전체 ≈ √(θ_평면안² + θ_평면수직²)
+
+    합치고 나면 더 이상 "한 성분만 본" 값이 아니므로 single_plane 을
+    내리고 정상 판정을 낸다.
+    """
+    th_plane = float(r.get("theta_deg_plane_only")
+                     if r.get("theta_deg_plane_only") is not None
+                     else (r.get("theta_deg") or 0.0))
+    th_lat = float(res["theta_deg"])
+    th = float(np.hypot(th_plane, th_lat))
+    r["theta_deg_plane_only"] = round(th_plane, 4)
+    r["theta_deg_lateral"] = round(th_lat, 4)
+    r["theta_deg"] = round(th, 4)
+    r["single_plane"] = False
+    kcs = _EQ5.KCS_CLASS.get(r["class"], r["class"])
+    j = _EQ3.judge_kcs(th, kcs, member_length_m=None)
+    j["resolved_by"] = resolved_by
+    j["theta_deg_plane_only"] = round(th_plane, 4)
+    j["theta_deg_lateral"] = round(th_lat, 4)
+    j["note"] = (
+        f"세로선 한 줄로는 레이저 평면 안 성분({th_plane:.4f}°)밖에 못 "
+        f"쟀다. {detail} 평면에 수직인 성분 {th_lat:.4f}° 를 되찾았고, "
+        f"둘을 제곱합으로 합쳐 {th:.4f}° 다. 직선 잔차 {res['rms_px']}px, "
+        f"세로 구간 {res['span_m']}m.")
+    r["judge"] = j
+    return j
+
+
+def _background_depth(regs, region, camera_params, u_px, v_px):
+    """
+    이 부재 **뒤쪽 바로 그 자리**의 배경 깊이를 구한다.
+
+    예전에는 배경 면의 깊이 중앙값 하나를 썼는데, 벽이 조금이라도 비스듬
+    하면 부재마다 뒤 거리가 달라 그림자 폭 예측이 틀어진다. 실측에서
+    둘째 동바리의 끊김이 그 때문에 44px 어긋나 통째로 버려졌다.
+
+    면은 이미 적합돼 있으므로, 부재가 보이는 화소의 광선을 그 면과 만나게
+    하면 바로 그 자리의 깊이가 나온다.
+
+        Z = −(d + n_x·b) / (n_x·û + n_y·v̂ + n_z)
+    """
+    f = float(camera_params["f_px"]); b = float(camera_params["b_m"])
+    cx = float(camera_params["cx_px"]); cy = float(camera_params["cy_px"])
+    uh = (float(u_px) - cx) / f
+    vh = (float(v_px) - cy) / f
+    out = []
+    for o in regs:
+        if o is region or o.get("kind") not in ("plane_vertical",
+                                                "plane_horizontal"):
+            continue
+        pl = o.get("plane")
+        if not pl or len(pl) != 4:
+            continue
+        n = np.asarray(pl[:3], float); dd = float(pl[3])
+        den = n[0] * uh + n[1] * vh + n[2]
+        if abs(den) < 1e-9:
+            continue
+        z = -(dd + n[0] * b) / den
+        if np.isfinite(z) and 0.05 < z < 60.0:
+            out.append(float(z))
+    return out
+
+
+def measure_member_silhouettes(result, aux_lines_uv, camera_params):
+    """
+    선형 부재(동바리·철근)의 **실루엣 가장자리**를 가로선 끊김에서 잰다.
+
+    왜 분할보다 먼저 재는가
+    ----------------------
+    가로선 화소를 어느 부재에 줄지 가르려면 부재가 이미지에서 얼마나
+    넓은지 알아야 한다. 예전에는 "축에서 옆으로 50mm 안" 이라는 상수를
+    썼는데, 이 값은 Ø48.6 동바리에서만 맞고 각재·기둥·철근에서 전부
+    틀린다. 좁게 잡으면 부재 화소가 뒤 벽으로 새고, 넓게 잡으면 벽
+    화소를 부재가 훔친다 — 그림에서 가로선이 부재를 뚫고 지나가거나,
+    부재가 실제보다 굵어 보인다.
+
+    폭은 상수로 정할 게 아니라 **재는** 것이다. 가로선이 부재를 지나는
+    자리에는 부재가 배경에 드리운 그림자만큼 끊김이 있고, 그 끊김의 부재
+    쪽 끝이 그 높이에서의 실루엣 가장자리다(eq8). 그 가장자리와 세로선이
+    맞은 자리 사이의 거리가 곧 관측된 반폭이다.
+
+        반폭[px] = |u_세로선 − u_가장자리|
+
+    한쪽만 보이므로 반대쪽은 대칭으로 잡는다. 원통 단면이 이미 풀린
+    부재(격자선 2줄 이상)는 반지름을 알고 있으니 그쪽을 먼저 쓴다.
+
+    둘 다 없으면 폭을 모른다 — 그때만 보수적인 기본값을 쓰고 그 사실을
+    결과에 남긴다(width_source="기본값"). 조용히 상수를 쓰지 않는다.
+    """
+    regs = result.get("regions") or []
+    axials = [r for r in regs if r.get("kind") == "axis_vertical"
+              and r.get("status") == "measured"]
+    if not axials:
+        return 0
+    f = float(camera_params["f_px"]); b = float(camera_params["b_m"])
+    n_meas = 0
+    for r in axials:
+        P = np.asarray(r.get("point_xyz"), float).reshape(-1, 3)
+        uv = np.asarray(r.get("point_uv"), float).reshape(-1, 2)
+        if len(P) < 10 or len(uv) < 10:
+            continue
+        z_m = float(np.median(P[:, 2]))
+        u_v = float(np.median(uv[:, 0]))
+        r["z_median_m"] = round(z_m, 4)
+
+        # (1) 단면이 풀렸으면 반지름이 곧 반폭이다.
+        rad_mm = float((r.get("axis") or {}).get("radius_est_mm") or 0.0)
+        if rad_mm > 1.0:
+            r["half_width_m"] = rad_mm / 1000.0
+            r["width_source"] = "단면 반지름"
+            n_meas += 1
+            continue
+
+        # (2) 가로선 끊김에서 실루엣 가장자리를 재 본다.
+        got = False
+        if aux_lines_uv:
+            zs = [z for z in _background_depth(
+                      regs, r, camera_params, u_v, float(np.median(uv[:, 1])))
+                  if z > z_m * 1.15]
+            if zs:
+                try:
+                    sh = _EQ8.member_edges_from_lines(
+                        aux_lines_uv, u_v, z_m, min(zs), f, b)
+                except Exception as e:
+                    sh = {"n_found": 0, "reason": f"실패: {e}"}
+                r["silhouette_edges"] = sh
+                if sh.get("n_found", 0) >= 4:
+                    # 끊김폭이 곧 부재의 화소 지름이다(eq8 유도 참고).
+                    hw_px = float(sh.get("radius_px") or 0.0)
+                    if 2.0 <= hw_px <= 0.25 * f:
+                        r["half_width_m"] = hw_px * z_m / f
+                        r["width_source"] = "가로선 끊김 폭"
+                        # 세로선이 부재의 한가운데를 맞으리라는 보장이 없다.
+                        # 끊김에서 되돌린 중심을 쓰면 창을 부재에 맞춰
+                        # 놓을 수 있다 — 가장자리에 맞은 부재일수록 크게
+                        # 다르다.
+                        E = np.asarray(sh["edges"], float)
+                        r["center_u_px"] = round(float(np.median(E[:, 1])), 2)
+                        r["center_offset_px"] = round(
+                            float(np.median(E[:, 1]) - u_v), 2)
+                        got = True
+                        n_meas += 1
+        if got:
+            continue
+
+        # (3) 못 쟀다 — 일단 비워 두고 아래에서 채운다.
+        r["half_width_m"] = None
+        r["width_source"] = None
+
+    # 못 잰 부재는 **같은 장면에서 잰 부재의 폭**을 빌린다. 한 현장의
+    # 동바리는 대개 같은 규격이고, 이미지와 무관한 상수보다 훨씬 낫다.
+    # 그마저 없을 때만 보수적 기본값을 쓰고 그 사실을 남긴다.
+    done = [r["half_width_m"] for r in axials if r.get("half_width_m")]
+    for r in axials:
+        if r.get("half_width_m"):
+            continue
+        if done:
+            r["half_width_m"] = float(np.median(done))
+            r["width_source"] = "같은 장면의 다른 부재 폭"
+        else:
+            r["half_width_m"] = 0.05
+            r["width_source"] = "기본값(폭 미측정)"
+    return n_meas
+
+
+def resolve_by_line_gaps(result, aux_lines_uv, camera_params, g_hat):
+    """
+    검출된 **가로선 화소의 끊김**으로 옆 기울기를 되찾는다.
+
+    가로선은 깊이를 못 준다. 그래서 오래도록 검측에서 빼 왔는데, 못 주는
+    것은 깊이일 뿐 화소 위치가 아니다. 가로선이 동바리를 지나는 자리에는
+    부재가 배경에 드리운 그림자만큼 끊김이 생기고, 그 끊김의 부재 쪽 끝이
+    그 높이에서의 실루엣 가장자리다. 높이를 따라 이 가장자리가 옆으로
+    밀리면 그것이 레이저 평면에 수직인 기울기 — 세로선 한 줄이 원리적으로
+    못 보던 성분이다. 깊이는 세로선에서 이미 알므로 화소를 미터로 되돌릴
+    수 있다.
+
+    ── 하지 않는 것 ──
+    "가로선이 부재를 덮은 구간의 **한가운데**" 를 쓰고 싶어지지만, 그건
+    안 된다. roll=0 에서 가로선은 시차가 선과 나란해 깊이를 못 주므로,
+    부재 위 화소와 뒤 벽 위 화소가 이어져 보인다. 부재의 반대쪽 가장자리
+    (그림자가 없는 쪽)는 신호에 아무 흔적을 남기지 않는다. 그래서 폭을
+    창(window)으로 잘라 중앙을 잡으면, 그 창은 **세로선에서 나온 축**을
+    중심으로 잡은 것이라 중앙이 축을 그대로 되돌려 준다 — 없는 정보를
+    지어내는 자기 확인이다. 실제로 그렇게 짜 봤더니 세 본 모두 잔차 0.0px
+    에 θ=0.0000° 가 나왔는데, 측정이 아니라 항등식이었다.
+
+    관측 가능한 가장자리는 **그림자 쪽 하나뿐**이고, 여기서는 그것만
+    쓴다. u_hint 는 어느 부재를 볼지 고르는 상수 하나일 뿐이라 높이에
+    따른 변화를 주지 못한다.
+
+    camera_params 는 **검측(센서) 좌표계** 기준이어야 한다 — aux_lines_uv
+    가 그 좌표계이기 때문이다.
+    """
+    if not aux_lines_uv:
+        return 0
+    regs = result.get("regions") or []
+    targets = [r for r in regs
+               if r.get("single_plane") and r.get("kind") == "axis_vertical"
+               and r.get("status") == "measured"]
+    if not targets:
+        return 0
+    f = float(camera_params["f_px"]); b = float(camera_params["b_m"])
+    cx = float(camera_params["cx_px"]); cy = float(camera_params["cy_px"])
+    n_ok = 0
+    for r in targets:
+        P = np.asarray(r.get("point_xyz"), float).reshape(-1, 3)
+        uv = np.asarray(r.get("point_uv"), float).reshape(-1, 2)
+        if len(P) < 10 or len(uv) < 10:
+            r["line_gap"] = {"ok": False, "reason": "점 부족"}
+            continue
+        z_m = float(np.median(P[:, 2]))
+        # 뒤 배경 — 부재가 보이는 바로 그 자리에서 잰다(벽이 비스듬해도
+        # 부재마다 맞는 거리가 나온다).
+        zs = [z for z in _background_depth(
+                  regs, r, camera_params, float(np.median(uv[:, 0])),
+                  float(np.median(uv[:, 1]))) if z > z_m * 1.15]
+        if not zs:
+            r["line_gap"] = {"ok": False,
+                             "reason": "뒤에 배경 면이 없어 그림자가 안 생긴다"}
+            continue
+        try:
+            res = _EQ8.axis_from_line_gaps(
+                aux_lines_uv, float(np.median(uv[:, 0])), z_m, min(zs),
+                f, cx, cy, b, g_hat)
+        except Exception as e:
+            res = {"ok": False, "reason": f"실패: {e}"}
+        res["z_member"] = round(z_m, 4)
+        res["z_background"] = round(float(min(zs)), 4)
+        r["line_gap"] = res
+        if not res.get("ok"):
+            continue
+        sh = res.get("shadow") or {}
+        detail = (f"가로선 {res['n_lines']}줄이 부재를 지나며 생긴 끊김"
+                  f"(폭 중앙값 {sh.get('gap_px')}px, 예측 "
+                  f"{sh.get('expected_width_px')}px)의 부재 쪽 끝을 높이별로 "
+                  f"뽑아")
+        _apply_lateral(r, res, "가로선 화소 끊김 (eq8)", detail)
         n_ok += 1
     return n_ok
 
@@ -211,17 +445,74 @@ def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):
     f = float(camera_params["f_px"]); b = float(camera_params["b_m"])
     cx = float(camera_params["cx_px"]); cy = float(camera_params["cy_px"])
 
-    # 면으로 확정된 영역만 후보다. 선형 부재(동바리·철근)는 면이 없다.
+    # 후보 면을 모은다. 두 종류다.
+    #
+    #  (1) 면 부재(벽·바닥) — 이미 적합된 평면을 그대로 쓴다.
+    #  (2) 선형 부재(동바리·철근) — 평면이 없다. 예전에는 그래서 후보에서
+    #      아예 빠졌고, 그 결과 **동바리를 가로지르는 가로선 화소가 뒤의
+    #      벽으로 던져져 벽 색으로 칠해졌다**. 눈으로 보면 가로선이
+    #      동바리를 뚫고 지나간 것처럼 보인다 — 분할이 틀린 것이다.
+    #
+    #      동바리에도 면을 하나 줄 수 있다. 세로선에서 이미 잡힌 측정점은
+    #      원통의 **앞면**에 놓여 있으므로, 축 방향 d 를 품고 시선에
+    #      수직인 접평면을 세우고 그 위치를 측정점 평균으로 잡으면 된다.
+    #
+    #          n = normalize(ẑ − (ẑ·d)d),   t = mean(n·P_측정)
+    #
+    #      지름을 몰라도 된다 — 앞면 깊이를 가정이 아니라 측정에서 가져오기
+    #      때문이다. 곡률 때문에 옆으로 갈수록 조금씩 앞서지만(최대 반지름
+    #      정도), 이 점은 어차피 측정값이 아니라 표시용 유도값이다.
     cands = []
     for k, r in enumerate(results):
-        pl = r.get("plane")        # (a, b, c, d) — aX+bY+cZ+d = 0
-        if not pl or len(pl) != 4 or r.get("status") != "measured":
+        if r.get("status") != "measured":
             continue
-        P = np.asarray(r["point_xyz"], float)
-        cands.append({"idx": k, "n": np.asarray(pl[:3], float),
-                      "d": float(pl[3]),
-                      "lo": P.min(axis=0) - margin_m,
-                      "hi": P.max(axis=0) + margin_m})
+        P = np.asarray(r.get("point_xyz"), float).reshape(-1, 3)
+        if len(P) < 3:
+            continue
+        pl = r.get("plane")        # (a, b, c, d) — aX+bY+cZ+d = 0
+        ax = r.get("axis") or {}
+        if pl and len(pl) == 4:
+            cands.append({"idx": k, "n": np.asarray(pl[:3], float),
+                          "d": float(pl[3]), "shape": "plane",
+                          "lo": P.min(axis=0) - margin_m,
+                          "hi": P.max(axis=0) + margin_m})
+        elif ax.get("direction") is not None:
+            dv = np.asarray(ax["direction"], float)
+            nv = np.linalg.norm(dv)
+            if nv <= 1e-9:
+                continue
+            dv = dv / nv
+            n = np.array([0.0, 0.0, 1.0]) - dv[2] * dv     # 시선의 축직교 성분
+            nn = np.linalg.norm(n)
+            if nn <= 1e-6:                                  # 축이 시선과 나란함
+                continue
+            n = n / nn
+            t = float(np.mean(P @ n))
+            c0 = np.asarray(ax.get("centroid", P.mean(axis=0)), float)
+            # 옆으로 얼마까지 이 부재로 볼 것인가 —
+            # measure_member_silhouettes 가 **재 놓은** 반폭을 쓴다.
+            # (상수를 쓰면 부재 지름이 바뀌는 순간 분할이 틀린다.)
+            hw = float(r.get("half_width_m") or 0.0)
+            if hw <= 1e-4:
+                hw = float(ax.get("radius_est_mm") or 0.0) / 1000.0
+            if hw <= 1e-4:
+                hw = 0.05
+            # 창의 중심 — 끊김에서 부재 중심을 되돌렸으면 그리로 옮긴다.
+            off = float(r.get("center_offset_px") or 0.0)
+            if abs(off) > 0.5:
+                lat = np.cross(dv, n)
+                nl = np.linalg.norm(lat)
+                if nl > 1e-6:
+                    z0 = float(np.median(P[:, 2]))
+                    c0 = c0 + (lat / nl) * (off * z0 / f)
+            s_ax = P @ dv
+            cands.append({"idx": k, "n": n, "d": -t, "shape": "axis",
+                          "axis_dir": dv, "axis_pt": c0,
+                          "lat_max": hw * 1.1 + 0.004,
+                          "s_lo": float(s_ax.min()) - margin_m,
+                          "s_hi": float(s_ax.max()) + margin_m})
+        else:
+            continue
         r.setdefault("aux_point_uv", [])
         r.setdefault("aux_point_xyz", [])
     if not cands:
@@ -240,9 +531,18 @@ def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):
             with np.errstate(divide="ignore", invalid="ignore"):
                 Z = -(d + n[0] * b) / den
             P = np.column_stack([b + Z * uh, Z * vh, Z])
-            ok = (np.isfinite(Z) & (Z > 0.05) & (Z < 60.0)
-                  & np.all(P >= c["lo"], axis=1) & np.all(P <= c["hi"], axis=1)
-                  & (Z < best_z))
+            ok = np.isfinite(Z) & (Z > 0.05) & (Z < 60.0) & (Z < best_z)
+            if c["shape"] == "plane":
+                ok &= (np.all(P >= c["lo"], axis=1)
+                       & np.all(P <= c["hi"], axis=1))
+            else:
+                # 축에서 옆으로 얼마나 벗어났나 / 축을 따라 어디쯤인가
+                q = P - c["axis_pt"]
+                s_ax = q @ c["axis_dir"]
+                lat = np.linalg.norm(q - np.outer(s_ax, c["axis_dir"]), axis=1)
+                s_abs = P @ c["axis_dir"]
+                ok &= ((lat <= c["lat_max"]) & (s_abs >= c["s_lo"])
+                       & (s_abs <= c["s_hi"]))
             best_z[ok] = Z[ok]
             best_i[ok] = c["idx"]
         for c in cands:
@@ -322,39 +622,71 @@ def measure_region(points_3d, cls, g_hat, camera_params,
             # 적용할 KCS 허용치도 고를 수 없다. 조서 비고에 남긴다.
             j["note"] = ((j.get("note") + " / ") if j.get("note") else "") \
                 + ax["note"]
-        # ── 격자선 한 줄만 걸린 부재는 각도를 "잰" 것이 아니다 ──
-        # 한 줄에서 나온 3D 점은 삼각측량의 정의상 **그 레이저 평면 안**에
-        # 놓인다. 그러면 축 적합이 찾는 것은 부재의 축이 아니라 부재
-        # 표면과 그 평면의 교선이고, 교선은 평면 안에서만 기울 수 있다.
+        # ── 격자선 한 줄짜리 부재: 재긴 재되, 절반만 잰다 ──
+        # 한 줄에서 나온 3D 점도 깊이는 제대로 나온다. 부재 위쪽 화소와
+        # 아래쪽 화소의 Z 가 다르면 그 차이가 곧 기울기다 —
         #
-        #   · 평면 안 기울기  → 보인다
-        #   · 평면에 수직인 기울기 → **전혀 안 보인다**
+        #       tan θ_평면안 = (Z_아래 − Z_위) / (관측 구간 길이)
         #
-        # 즉 나온 각도는 참 기울기의 한 성분일 뿐이고 참값은 항상 그보다
-        # 크거나 같다(두 성분이 제곱합이므로). 이걸 합격으로 내주면,
-        # 안 보이는 성분이 허용치를 넘어도 합격이 된다. 실측에서 동바리
-        # 세 본이 전부 "수직도 0.0000° 합격" 으로 나왔는데, 그 0 은
-        # 측정값이 아니라 기하의 결과였다.
+        # 이것이 축 적합(fit_axis_pca)이 실제로 하는 일이고, 잡음 없는
+        # 검증에서 참 1.00°/2.00° 를 1.0000°/2.0000° 로 되돌린다
+        # (Ø48.6mm·1.65m 기준 ΔZ = 29.88mm / 59.74mm, Δu = 2.70px / 5.40px).
+        #
+        # 다만 그렇게 잡히는 것은 **레이저 평면 안** 성분뿐이다. 한 줄에서
+        # 나온 점은 삼각측량의 정의상 그 평면 위에 놓이므로, 축 적합이
+        # 찾는 것은 부재의 축이 아니라 표면과 평면의 교선이고, 교선은
+        # 평면 안에서만 기울 수 있다.
+        #
+        #   · 평면 안 기울기(카메라 쪽으로 넘어짐)  → ΔZ 로 보인다
+        #   · 평면에 수직인 기울기(옆으로 넘어짐)   → ΔZ = 0.00mm, 안 보인다
+        #
+        # 그래서 잰 값은 참 기울기의 한 성분(θ·cos φ)이고, 참값은 항상
+        # 그보다 크거나 같다(두 성분이 제곱합이므로). 방향이 하나뿐인
+        # 부등식이므로 판정도 한쪽으로만 성립한다:
+        #
+        #   · 잰 값이 이미 허용치를 넘었다 → **기준초과가 확정**이다.
+        #     참값은 더 크니 결론이 뒤집힐 수 없다.
+        #   · 잰 값이 허용치 이내다 → 합격이라 말할 수 없다. 안 보이는
+        #     성분이 허용치를 넘었을 수 있다. 실측에서 동바리 세 본이
+        #     "0.0000° 합격" 으로 나왔는데, 그 0 은 측정값이 아니라
+        #     기하의 결과였다.
+        #
+        # 즉 한 줄짜리 측정은 부재를 **떨어뜨릴 수는 있어도 붙여줄 수는
+        # 없다**. 아래가 그 비대칭을 그대로 옮긴 것이다.
         single_plane = (n_lines is not None and n_lines <= 1) or (
             not ax.get("cross_section_resolved", True)
             and float(ax.get("radius_est_mm") or 0.0) <= 1e-6)
         out["single_plane"] = bool(single_plane)
         out["n_lines"] = (int(n_lines) if n_lines is not None else None)
         if single_plane:
-            j["is_pass"] = None
-            j["judgement"] = "판정보류(단면 미분해)"
             j["cross_section_resolved"] = False
-            j["measured_component"] = "레이저 평면 안 성분만"
-            j["note"] = (
-                (j.get("note") + " / " if j.get("note") else "")
-                + f"격자선이 한 줄만 걸렸다"
-                + (f"(선 {int(n_lines)}개)" if n_lines is not None else "")
-                + f". 한 줄에서 나온 점은 그 레이저 평면 안에 놓이므로, "
-                  f"잰 {theta:.4f}° 는 **평면 안 성분**일 뿐이고 평면에 "
-                  f"수직인 기울기는 보이지 않는다. 참 기울기는 이 값보다 "
-                  f"크거나 같다 — 합격 판정을 내릴 수 없다. 부재에 격자선이 "
-                  f"두 줄 이상 걸리도록 더 가까이서 찍거나 격자를 조밀하게 "
-                  f"할 것")
+            j["measured_component"] = "레이저 평면 안 성분만 (참값의 하한)"
+            j["theta_deg_lower_bound"] = round(float(theta), 4)
+            j["theta_deg_is_lower_bound"] = True
+            head = ("격자선이 한 줄만 걸렸다"
+                    + (f"(선 {int(n_lines)}개)" if n_lines is not None else "")
+                    + f". 부재 위쪽 화소와 아래쪽 화소의 깊이 차이로 "
+                      f"{theta:.4f}° 를 쟀는데, 이것은 **레이저 평면 안**"
+                      f"으로 넘어진 성분뿐이다. 평면에 수직으로(옆으로) "
+                      f"넘어진 성분은 깊이를 바꾸지 않아 보이지 않는다. "
+                      f"참 기울기는 이 값보다 크거나 같다. ")
+            if j.get("is_pass") is False:
+                # 하한이 이미 허용치를 넘었다 → 참값은 더 크다. 확정이다.
+                j["judgement"] = "기준초과"
+                tail = (f"다만 이 하한이 이미 허용치를 넘었으므로 "
+                        f"**기준초과는 확정**이다 — 보이지 않는 성분이 "
+                        f"더해지면 값은 커지기만 한다. 실제 기울기 크기와 "
+                        f"방향까지 알려면 격자선이 두 줄 이상 걸리도록 "
+                        f"다시 찍을 것")
+            else:
+                j["is_pass"] = None
+                j["judgement"] = "판정보류(단면 미분해)"
+                tail = (f"허용치({j.get('allow_deg')}°) 이내로 나왔지만 "
+                        f"합격이라 말할 수 없다 — 보이지 않는 성분이 허용치를 "
+                        f"넘었을 수 있다. 부재에 격자선이 두 줄 이상 걸리도록 "
+                        f"더 가까이서 찍거나 격자를 조밀하게 할 것")
+            j["note"] = ((j.get("note") + " / " if j.get("note") else "")
+                         + head + tail)
 
         if unc is not None:
             j["angle_uncertainty_deg"] = unc
@@ -740,12 +1072,26 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
 
     # 깊이를 못 주는 선(가로선)의 화소도 결과 그림에는 나와야 한다.
     # 검측에는 넣지 않고 aux_ 로 따로 들고 간다.
-    n_aux = 0
+    n_aux = n_cross = 0
     if aux_lines_uv:
+        # 가르기 전에 부재 폭을 먼저 잰다 — 폭을 모르면 가를 수 없다.
+        try:
+            measure_member_silhouettes({"regions": results}, aux_lines_uv,
+                                       camera_params)
+        except Exception:
+            pass
         try:
             n_aux = place_aux_points(results, aux_lines_uv, camera_params)
         except Exception:
             n_aux = 0
+        # 가로선 화소는 그림에만 쓰는 게 아니다. 부재를 가로지른 자리의
+        # 중심이 세로선 한 줄로는 못 보던 옆 기울기를 준다.
+        try:
+            n_cross = resolve_by_line_gaps({"regions": results},
+                                           aux_lines_uv, camera_params,
+                                           g_hat)
+        except Exception:
+            n_cross = 0
 
     # 각 영역의 끝이 "부재의 끝" 인지 "격자가 닿은 데까지" 인지 가른다.
     # 셋 다 같은 화소 구간을 훑었는데 거리가 달라 미터값만 달라진 경우를
@@ -776,6 +1122,7 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
         "regions_split": n_split,
         "linear_members_rescued": n_linear_rescued,
         "aux_points": int(n_aux),
+        "crossing_resolved": int(n_cross),
         "flatness_unmeasurable": sum(
             1 for r in measured
             if (r["flatness"] or {}).get("judgement") == "측정불가"),

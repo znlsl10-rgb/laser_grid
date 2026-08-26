@@ -1051,6 +1051,10 @@ def region_xyz_summary(result, g_hat=None):
             "선구성": (" / ".join(f"{k} {v:,}점" for k, v in sorted(fams.items()))
                     or None),
             "깊이이득_RMS": r.get("depth_gain_rms"),
+            # 분할 폭은 상수가 아니라 잰 값이다 — 어디서 왔는지 함께 남긴다.
+            "부재반폭_mm": (round(float(r["half_width_m"]) * 1000.0, 1)
+                       if r.get("half_width_m") else None),
+            "폭_근거": r.get("width_source"),
             "중심_X_m": round(float(P[:, 0].mean()), 4),
             "중심_Y_m": round(float(P[:, 1].mean()), 4),
             "중심_Z_m": round(float(P[:, 2].mean()), 4),

@@ -213,6 +213,141 @@ def axis_from_edges(edges, z_member, f_px, cx_px, cy_px, b_m, g_hat,
     return out
 
 
+def member_edges_from_lines(lines_uv, u_hint, z_member, z_background,
+                            f_px, b_m, search_px=140.0, min_gap_px=6.0,
+                            center_tol_frac=1.5):
+    """
+    **검출된 가로선 화소열의 끊김** 에서 부재의 폭과 중심선을 되돌린다.
+
+    끊김은 부재가 아니라 벽에 생긴 그림자다
+    -------------------------------------
+    처음에는 끊김의 끝을 곧바로 부재 실루엣으로 썼는데, 실측을 보니
+    아니었다. 가로선이 부재를 지날 때 부재 위 화소와 그 옆 벽 위 화소는
+    **끊기지 않고 이어진다** — roll=0 에서 가로선은 시차가 선과 나란해
+    깊이가 화소를 움직이지 못하기 때문이다. 실제로 끊기는 것은 부재
+    **뒤 벽**에서 조사기 빛이 못 닿는 구간이다.
+
+    그래서 끊김은 부재에서 옆으로 밀려 있다. 조사기를 (−b,0,0), 부재를
+    (X_p, Z_m), 벽을 Z_bg 라 두고 조사기에서 부재 중심을 지나는 광선이
+    벽에 닿는 자리를 카메라로 보면
+
+        Δu = f·b·(1/Z_m − 1/Z_bg) = w          (그림자 폭 공식과 같은 값)
+
+    만큼 밀려 보인다. 끊김의 폭은 부재 지름이 조사기에서 벽으로 확대
+    투영된 것이 다시 카메라에서 축소되어 결국
+
+        끊김[px] ≈ 2R·f/Z_m = 부재의 화소 지름
+
+    이 된다. 두 관계를 뒤집으면 **끊김 하나에서 부재의 지름과 중심을
+    동시에** 얻는다.
+
+        R[px]      = 끊김폭 / 2
+        u_중심(v)  = u_왼끝(v) + 끊김폭/2 − w          (b > 0 일 때)
+
+    지름을 가정하지 않는다는 점이 중요하다. Ø48.6 동바리든 각재든 철근이든
+    같은 식이 성립하므로, 다른 현장·다른 부재에서도 그대로 쓴다.
+
+    자기 확인 방지
+    -------------
+    u_hint 는 **높이에 무관한 상수** 하나다(어느 부재의 끊김인지 고를
+    때만 쓴다). 높이에 따른 변화는 전부 화소에서 온다. 되돌린 중심이
+    u_hint 에서 부재 반폭 이상 벗어나면 남의 끊김을 잡은 것이므로 버린다 —
+    실측에서 둘째 동바리가 44px 어긋난 끊김을 물었고, 그대로 두면 없는
+    폭 154mm 를 지어냈다(참 48.6mm).
+
+    Returns
+    -------
+    dict — edges (M,2)[v, u_중심], n_found, radius_px, gap_px, offset_px
+    """
+    w = shadow_width_px(z_member, z_background, f_px, b_m)
+    if w is None or not np.isfinite(w) or abs(w) < 1e-6:
+        return {"n_found": 0, "edges": np.empty((0, 2)),
+                "reason": "부재와 배경의 깊이차가 없어 그림자가 안 생긴다"}
+    near = 0 if w > 0 else 1        # 그림자가 밀리는 쪽 = 끊김의 부재 쪽 끝
+
+    # ── 추적기가 끊는 폭을 이미지 자체에서 보정한다 ──
+    # 능선 추적은 신호가 끊기는 자리마다 부분적으로 켜진 화소를 버려서,
+    # 끊김을 실제보다 조금 넓게 잰다. 그 양은 선 굵기에서 오므로 같은
+    # 이미지 안의 **작은 끊김**(다른 선이 가로지른 자리)으로 잴 수 있다.
+    # 보정 없이 쓰면 실측에서 지름이 10% 부풀었다(26.8mm, 참 24.3mm).
+    small = []
+    for uv in lines_uv.values():
+        A = np.asarray(uv, dtype=float).reshape(-1, 2)
+        if len(A) < 8:
+            continue
+        du = np.diff(np.sort(A[:, 0]))
+        small.extend(du[(du > 1.2) & (du < float(min_gap_px))].tolist())
+    drop_px = float(np.median(small)) if len(small) >= 8 else 0.0
+
+    rows = []                       # (v, u_center, gap, u_near)
+    for uv in lines_uv.values():
+        A = np.asarray(uv, dtype=float).reshape(-1, 2)
+        if len(A) < 8:
+            continue
+        A = A[np.argsort(A[:, 0])]
+        u, v = A[:, 0], A[:, 1]
+        du = np.diff(u)
+        best = None
+        for k in np.nonzero(du > float(min_gap_px))[0]:
+            g = float(du[k])
+            u_near = float(u[k]) if near == 0 else float(u[k + 1])
+            # 끊김폭이 곧 화소 지름이므로 중심을 바로 되돌릴 수 있다.
+            u_c = u_near + (0.5 * g if near == 0 else -0.5 * g) - w
+            d = abs(u_c - u_hint)
+            if d > search_px:
+                continue
+            if best is None or d < best[0]:
+                best = (d, float(0.5 * (v[k] + v[k + 1])), u_c, g, u_near)
+        # 되돌린 중심이 부재 반폭 밖이면 남의 끊김이다.
+        if best is not None and best[0] <= center_tol_frac * 0.5 * best[3]:
+            rows.append(best[1:])
+    if len(rows) < 4:
+        return {"n_found": len(rows), "edges": np.empty((0, 2)),
+                "expected_offset_px": round(float(w), 2),
+                "reason": f"부재의 끊김을 확인한 가로선이 {len(rows)}개뿐"}
+
+    C = np.asarray(rows, float)     # [v, u_center, gap, u_near]
+    gap = float(np.median(C[:, 2]))
+    # 보정은 끊김의 30% 를 넘지 않을 때만 — 그보다 크면 작은 끊김을
+    # 잘못 잰 것이므로 손대지 않는다.
+    corr = drop_px if 0.0 < drop_px <= 0.30 * gap else 0.0
+    return {"n_found": int(len(C)), "edges": C[:, :2],
+            "radius_px": round((gap - corr) / 2.0, 2),
+            "dropout_px": round(corr, 2),
+            "gap_px": round(gap, 2),
+            "gap_spread_px": round(float(np.percentile(C[:, 2], 90)
+                                         - np.percentile(C[:, 2], 10)), 2),
+            "center_offset_px": round(float(np.median(C[:, 1]) - u_hint), 2),
+            "expected_offset_px": round(float(w), 2),
+            "side": ("좌" if near == 0 else "우")}
+
+
+def axis_from_line_gaps(lines_uv, u_hint, z_member, z_background,
+                        f_px, cx_px, cy_px, b_m, g_hat,
+                        search_px=90.0, max_rms_px=2.5, **kw):
+    """
+    가로선 화소열의 끊김으로 레이저 평면에 **수직인** 기울기를 잰다.
+
+    member_edges_from_lines 가 끊김에서 되돌린 **부재 중심선**을 높이별로
+    받아, 부재 깊이에 놓고 직선을 맞춘다(axis_from_edges 와 같은 계산).
+    그림자 경계는 조사기에서 벽으로의 중심투영이라 두 축이 같은 배율로
+    늘어나므로 **방향은 보존된다** — 그래서 벽에서 읽은 자국으로 부재의
+    기울기를 잴 수 있다. 원본 신호를 훑는 resolve_member 와 같은 양을
+    재므로 둘 다 되면 서로 검산이 된다.
+    """
+    sh = member_edges_from_lines(lines_uv, u_hint, z_member, z_background,
+                                 f_px, b_m, search_px=search_px, **kw)
+    if sh["n_found"] < 4:
+        return {"ok": False, "reason": sh.get("reason") or "가장자리 부족",
+                "shadow": {k: v for k, v in sh.items() if k != "edges"}}
+    out = axis_from_edges(sh["edges"], z_member, f_px, cx_px, cy_px, b_m,
+                          g_hat, max_rms_px=max_rms_px)
+    out["shadow"] = {k: v for k, v in sh.items() if k != "edges"}
+    out["n_lines"] = int(sh["n_found"])
+    out["cue"] = "가로선 화소 끊김"
+    return out
+
+
 def resolve_member(signal, region, other_regions, cp, g_hat,
                    rows=None, search_px=90.0, to_image=None):
     """

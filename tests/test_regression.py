@@ -804,6 +804,22 @@ def test_single_line_member():
           f"{r2['theta_deg']:.4f}° 로 보인다 — 그래서 합격 금지가 맞다",
           abs(r2["theta_deg"]) < 0.01 and th_true > 1.0)
 
+    # ── 한 줄짜리 판정의 비대칭 ──
+    # 잰 값은 참값의 **하한**이다(참값 = √(잰값² + 못 본 성분²)).
+    # 그래서 부등식이 한쪽으로만 성립한다: 하한이 이미 허용치를 넘었으면
+    # 참값은 더 크니 기준초과가 **확정**이고, 이내면 아무 말도 못 한다.
+    # 즉 한 줄짜리 측정은 부재를 떨어뜨릴 수는 있어도 붙여줄 수는 없다.
+    big = one.copy()
+    big[:, 2] += np.tan(np.radians(2.0)) * (y - y.mean())   # 평면 '안'으로
+    r4 = PIPE.measure_region(big, "shoring", g, cp, n_lines=1)
+    j4 = r4.get("judge") or {}
+    check(f"한 줄이라도 하한 {r4['theta_deg']:.3f}° 가 허용 "
+          f"{j4.get('allow_deg')}° 를 넘으면 '{j4.get('judgement')}' 확정",
+          j4.get("judgement") == "기준초과" and j4.get("is_pass") is False
+          and j4.get("theta_deg_is_lower_bound") is True)
+    check("허용치 이내인 한 줄은 여전히 판정보류",
+          (r.get("judge") or {}).get("is_pass") is None)
+
     # 두 줄 이상이면 정상 판정으로 돌아온다
     t = np.linspace(-1.0, 1.0, 600)
     axis = np.array([np.sin(np.radians(0.3)), np.cos(np.radians(0.3)), 0.0])
@@ -871,6 +887,78 @@ def test_silhouette_recovery():
           and all(abs(e[1] - edge_true) <= 1 for e in got["edges"]))
 
 
+def test_line_gap_recovery():
+    """[16] 가로선 화소의 끊김에서 부재 폭·중심·옆 기울기를 되돌린다"""
+    print("\n[16] 가로선 끊김 — 폭과 옆 기울기")
+    f, b, cx, cy = 826.0, 0.15, 634.5, 531.5
+    g = np.array([0.0, 1.0, 0.0])
+    Zm, Zbg = 1.70, 2.70
+    R_m = 0.0243
+    R_px = R_m * f / Zm
+    w = EQ8.shadow_width_px(Zm, Zbg, f, b)
+    drop = 4.0                      # 추적기가 끊는 폭(합성에도 넣는다)
+    X_c0 = 0.20
+
+    def build(tilt_deg, n=21, decoy=False):
+        """가로선 화소열을 만든다 — 부재 그림자만큼 끊어서."""
+        lines = {}
+        for i, vv in enumerate(np.linspace(120.0, 980.0, n)):
+            Y = (vv - cy) * Zm / f
+            X = X_c0 + np.tan(np.radians(tilt_deg)) * Y
+            u_c = (X - b) * f / Zm + cx
+            lo = u_c + w - R_px - 0.5 * drop
+            hi = u_c + w + R_px + 0.5 * drop
+            u = np.arange(60.0, 1200.0, 0.25)
+            u = u[(u < lo) | (u > hi)]
+            # 다른 선이 가로지른 자리 — 작은 끊김(보정용 표본)
+            for uk in (150.0, 300.0, 900.0, 1050.0):
+                u = u[(u < uk) | (u > uk + drop)]
+            if decoy:               # 남의 부재 그림자 — 3R 떨어진 자리
+                d0 = u_c + w + 6 * R_px
+                u = u[(u < d0) | (u > d0 + 2 * R_px + drop)]
+            lines[f"H{i}"] = np.column_stack([u, np.full_like(u, vv)])
+        return lines
+
+    lines = build(0.0)
+    sh = EQ8.member_edges_from_lines(lines, (X_c0 - b) * f / Zm + cx,
+                                     Zm, Zbg, f, b)
+    check(f"끊김을 {sh['n_found']}/21 줄에서 찾는다", sh["n_found"] == 21)
+    check(f"끊김폭에서 지름 복원 {sh['radius_px']:.2f}px (참 {R_px:.2f}px, "
+          f"추적손실 {sh['dropout_px']}px 보정)",
+          abs(sh["radius_px"] - R_px) < 0.06 * R_px)
+
+    for tilt in (0.0, 0.5, 1.5):
+        r = EQ8.axis_from_line_gaps(build(tilt), (X_c0 - b) * f / Zm + cx,
+                                    Zm, Zbg, f, cx, cy, b, g)
+        check(f"옆 기울기 {tilt}° → 복원 {r.get('theta_deg')}° "
+              f"(잔차 {r.get('rms_px')}px)",
+              r.get("ok") and abs(r["theta_deg"] - tilt) < 0.05)
+
+    # ── 자기 확인이 아님을 못 박는다 ──
+    # 부재 위치 힌트를 흔들어도 답이 그대로여야 한다. 힌트가 답에 스미면
+    # 그건 측정이 아니라 항등식이다(창 중앙을 쓰던 옛 방식이 그랬다).
+    base = EQ8.axis_from_line_gaps(build(1.0), (X_c0 - b) * f / Zm + cx,
+                                   Zm, Zbg, f, cx, cy, b, g)
+    moved = [EQ8.axis_from_line_gaps(build(1.0),
+                                     (X_c0 - b) * f / Zm + cx + dd,
+                                     Zm, Zbg, f, cx, cy, b, g)["theta_deg"]
+             for dd in (-20.0, 20.0)]
+    check(f"힌트를 ±20px 옮겨도 답이 끌려가지 않는다 "
+          f"({base['theta_deg']}° vs {moved[0]}°/{moved[1]}°, 참 1.0°)",
+          all(abs(m - 1.0) < 0.02 for m in moved))
+
+    # 남의 끊김은 물지 않는다 — 되돌린 중심이 부재 반폭 밖이면 버린다
+    sh2 = EQ8.member_edges_from_lines(build(0.0, decoy=True),
+                                      (X_c0 - b) * f / Zm + cx, Zm, Zbg, f, b)
+    check(f"6R 떨어진 남의 끊김에 속지 않는다 (폭 {sh2['radius_px']:.2f}px)",
+          sh2["n_found"] == 21 and abs(sh2["radius_px"] - R_px) < 0.06 * R_px)
+
+    # 배경이 없으면 그림자가 없으니 조용히 실패해야 한다
+    bad = EQ8.axis_from_line_gaps(lines, (X_c0 - b) * f / Zm + cx,
+                                  Zm, Zm, f, cx, cy, b, g)
+    check("깊이차가 없으면 되살리지 않는다", not bad.get("ok"))
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -882,7 +970,7 @@ def main():
               test_eq7_laser_plane, test_h_lines_in_pipeline,
               test_pointcloud_export, test_rolled_grid_detection,
               test_run_pipeline_inputs, test_single_line_member,
-              test_silhouette_recovery):
+              test_silhouette_recovery, test_line_gap_recovery):
         t()
     print("\n" + "=" * 70)
     if _FAILS:
