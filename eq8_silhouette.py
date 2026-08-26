@@ -78,13 +78,32 @@
   동바리·철근은 등단면이라 문제없지만, 조서에 근거를 남긴다.
 ========================================================================
 """
+import os as _os
+import importlib.util as _ilu
+
 import numpy as np
 
 
-def laser_signal(rgb):
-    """초록 과잉분 — 레이저만 남긴다."""
-    a = np.asarray(rgb, dtype=float)
-    return a[:, :, 1] - 0.5 * (a[:, :, 0] + a[:, :, 2])
+def _load(name):
+    spec = _ilu.spec_from_file_location(
+        name, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                            f"{name}.py"))
+    m = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+_LSIG = _load("laser_signal")
+
+
+def laser_signal(rgb, off=None, channel=None):
+    """
+    레이저만 남긴다 — 채널은 laser_signal 모듈이 이미지에서 판별한다.
+
+    여기서는 음수를 자르지 **않는다**. 그림자는 신호가 없는 자리라
+    0 쪽으로 눌러 버리면 가장자리가 뭉개진다.
+    """
+    return _LSIG.laser_signal(rgb, off=off, channel=channel, clip=False)
 
 
 def shadow_width_px(z_member, z_background, f_px, b_m):

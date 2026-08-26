@@ -74,6 +74,7 @@ DETECT = _load("A_선검출")
 PIPE = _load("pipeline_region")
 REPORT = _load("report")
 PLOT3D = _load("plot_points3d")
+_LSIG = _load("laser_signal")
 XLS = _load("report_excel")
 LC = _load("load_capture")
 
@@ -295,6 +296,51 @@ def _line_planes_from_truth(truth, cp):
     return None          # 자세를 모르면 세계좌표를 조사기좌표로 못 옮긴다
 
 
+# ---------------------------------------------------------------------
+# 사양 확인용 격자 읽기 — 예측 없이 이미지만 본다
+# ---------------------------------------------------------------------
+# 선검출(A_선검출)은 예측 격자를 씨앗으로 쓰므로, 사양이 틀린
+# 상태에서는 예측이 어긋나 아무것도 못 찾는다. 거리·뒤집힘을
+# 되찾는 단계에서는 예측 없이 읽어야 해서 축 투영 + 임계만 쓴다.
+# (예전 inspect_png.py 에 있던 것 — 그 파일의 나머지는 run() 과
+#  겹치는 CLI 였으므로 지웠다.)
+def _line_positions(mask_1d, min_gap=3):
+    """1차원 투영 프로파일에서 선 중심 위치를 뽑는다."""
+    idx = np.where(mask_1d)[0]
+    if len(idx) == 0:
+        return np.array([])
+    breaks = np.where(np.diff(idx) > min_gap)[0]
+    groups = np.split(idx, breaks + 1)
+    return np.array([g.mean() for g in groups if len(g) >= 1])
+
+
+def read_grid_from_image(rgb, occupancy=0.35):
+    """
+    격자 이미지에서 V/H 선의 픽셀 위치를 읽는다.
+
+    선검출(A_선검출)은 예측 격자를 씨앗으로 쓰므로, 사양이 틀린 상태에서는
+    예측이 어긋나 아무것도 못 찾는다. 확인 단계에서는 예측 없이 이미지만
+    보고 읽어야 한다. 그래서 여기서는 축 투영 + 임계만 쓴다.
+
+    임계를 분위수로 잡으면 안 된다. 선이 차지하는 화소는 전체의 몇 %뿐이라
+    90% 분위수가 배경값이 되고, 그러면 화면 전체가 선으로 잡힌다. 신호의
+    중앙값과 최대값 사이에서 잡아야 한다.
+    """
+    # 채널은 laser_signal 이 이미지에서 판별한다(초록·빨강·파랑, 못 가르면
+    # 밝기). 여기서 초록으로 못박으면 빨간 레이저에서 통째로 실패한다.
+    signal = _LSIG.laser_signal(rgb)
+    med = float(np.median(signal))
+    hi = float(np.percentile(signal, 99.5))
+    if hi - med < 1e-6:
+        return np.array([]), np.array([])
+    m = signal >= med + 0.4 * (hi - med)
+    # 열별·행별 점유율. V선이 지나는 열은 대부분의 행이 켜져 있고,
+    # 그렇지 않은 열은 H선이 지나는 몇 행만 켜져 있다.
+    v = _line_positions(m.mean(axis=0) >= occupancy)
+    h = _line_positions(m.mean(axis=1) >= occupancy)
+    return v, h
+
+
 def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
     """
     이미지에서 격자를 직접 읽어 **측정거리와 화소 규약** 을 추정한다.
@@ -324,8 +370,7 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
     -------
     dict — z_est_m, flipped, resid_m, n_matched, ok
     """
-    INS = _load("inspect_png")
-    u_img, _ = INS.read_grid_from_image(rgb)
+    u_img, _ = read_grid_from_image(rgb)
     f, b = float(cp["f_px"]), float(cp["b_m"])
     cx, cy = float(cp["cx_px"]), float(cp["cy_px"])
     alphas = np.array(sorted(
@@ -601,6 +646,44 @@ def _run_full(image, params, truth, scene_image, imu, out, out_dir, name,
             "depth": depth, "sigma_u_px": su, "g_hat": g_hat, "images": imgs}
 
 
+def mark_provisional(res, reasons):
+    """
+    판정을 **참고값** 으로 낮춘다 — 근거가 가정 위에 서 있을 때.
+
+    왜 필요한가
+    ----------
+    camera_params.json 이 없으면 초점거리·기선·발사각을 사양 프로파일에서
+    가져온다. 그 가정이 틀리면 깊이가 통째로 배율만큼 어긋나는데, 각도는
+    그대로 그럴듯하게 나온다. IMU 가 없으면 장비가 똑바로 섰다고 가정하고,
+    그러면 숙여 찍은 바닥이 "기울어진 벽" 으로 읽힌다.
+
+    실측에서 바닥 캡처를 이미지만으로 돌렸더니 **4.4594° 기준초과** 가
+    나왔다. 같은 캡처를 사양 파일과 함께 돌리면 0.0390° 합격이다. 부재가
+    기운 게 아니라 장비가 숙여 있었을 뿐인데, 조서에는 불합격이 찍혔다.
+
+    면 부재냐 선형 부재냐는 그대로 갈린다 — 그건 점군 모양만으로 정해진다.
+    갈리지 않는 것은 **어느 검사를 걸 것인가**(수직도냐 수평도냐)와 그
+    허용치다. 그래서 값은 그대로 내고 도장만 뺀다.
+    """
+    if not reasons:
+        return 0
+    n = 0
+    for r in res.get("regions", []):
+        j = r.get("judge")
+        if not j or j.get("is_pass") is None:
+            continue
+        j["is_pass"] = None
+        j["judgement"] = "판정보류(근거 가정)"
+        j["provisional"] = True
+        j["note"] = ((j.get("note") + " / ") if j.get("note") else "") + (
+            "측정값은 그대로이나 판정 근거가 가정 위에 있다 — "
+            + "; ".join(reasons)
+            + ". 면/선형 구분과 점군은 영향받지 않는다. 확정 판정을 내려면 "
+              "카메라 사양(camera_params.json)이나 IMU 를 함께 넣을 것")
+        n += 1
+    return n
+
+
 def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
                rgb, qz, backend, site, pc_stride, standoff_m, say, smooth=0):
     """
@@ -739,6 +822,17 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
                              rgb_off=scene_rgb, seg_backend=backend,
                              sigma_u_px=su, line_gain=tri["line_gain"],
                              aux_lines_uv=tri.get("skipped_uv"))
+    # 근거가 가정 위에 있으면 도장을 뺀다 (값은 그대로 남는다)
+    _why = []
+    if not params:
+        _why.append("카메라 사양을 사양 프로파일에서 가정함 — 초점거리·기선·"
+                    "발사각이 실제와 다르면 깊이가 배율만큼 어긋난다")
+    if g_assumed:
+        _why.append("IMU 가 없어 장비가 똑바로 섰다고 가정함 — 숙여 찍었으면 "
+                    "바닥이 기운 벽으로 읽힌다")
+    _n_prov = mark_provisional(res, _why)
+    if _n_prov:
+        say(f"  [판정] 근거가 가정 위에 있어 {_n_prov}건을 참고값으로 낮춤")
     res["triangulation"] = tri
     res["pixel_source"] = "detected"
     res["depth_check"] = depth

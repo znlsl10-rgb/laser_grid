@@ -185,21 +185,30 @@ def _looks_like_imu(d):
         x in d for x in ("pitch_deg", "roll_deg", "gravity", "accel"))
 
 
-def _laser_score(path):
+def _laser_score(path, repo_dir=None):
     """
-    레이저 이미지인가 — 초록 과잉분(G−(R+B)/2)이 강하게 뜨는 화소 비율.
+    레이저 이미지인가 — 레이저 신호가 강하게 뜨는 화소 비율.
 
     파일 이름에 기대지 않는다. CAST/CAM 같은 규약을 모르는 사람이 올린
     사진도 가려야 하고, 반대로 이름만 맞고 내용이 다른 경우도 있다.
+    채널(초록·빨강·파랑)은 저장소의 laser_signal 이 이미지에서 판별한다.
     """
     try:
         from PIL import Image
         import numpy as np
         im = Image.open(path).convert("RGB")
         im.thumbnail((480, 480))
-        a = np.asarray(im, float)
-        s = a[:, :, 1] - 0.5 * (a[:, :, 0] + a[:, :, 2])
-        return float((s > 40).mean())
+        a = np.asarray(im, np.float32)
+        try:
+            import laser_signal as LS
+            s = LS.laser_signal(a)
+        except Exception:                 # 저장소를 아직 못 붙였을 때
+            s = a[:, :, 1] - 0.5 * (a[:, :, 0] + a[:, :, 2])
+        hi = float(np.percentile(s, 99.5))
+        med = float(np.median(s))
+        if hi - med < 1e-6:
+            return 0.0
+        return float((s > med + 0.5 * (hi - med)).mean())
     except Exception:
         return -1.0
 
@@ -308,6 +317,7 @@ def main(image=None, out=None, params=None, truth=None, imu=None,
     if repo_dir not in sys.path:
         sys.path.insert(0, repo_dir)
 
+    # find_inputs 가 laser_signal 을 쓰므로 저장소가 경로에 들어간 뒤다.
     found = find_inputs(image=image, verbose=verbose)
     image = os.path.abspath(image or found["image"])
     params = os.path.abspath(params) if params else found["params"]

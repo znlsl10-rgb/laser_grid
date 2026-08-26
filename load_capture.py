@@ -61,6 +61,7 @@ _EQ7 = _load("eq7_laser_plane")
 MATCH_TOL_PX = 5.0
 REPORT = _load("report")
 PLOT3D = _load("plot_points3d")
+_LSIG = _load("laser_signal")
 XLS = _load("report_excel")
 
 
@@ -421,8 +422,7 @@ def evaluate_line_detection(path, cap, image_name="CAST.png",
 
     # 렌더가 안티에일리어싱 없이 이진으로 그려졌는지 확인한다. 그렇다면
     # 선 위치가 0.5px 격자에 갇히고, 그것이 서브픽셀 정밀도의 하한이 된다.
-    gimg = (img[:, :, 1].astype(float)
-            - 0.5 * (img[:, :, 0].astype(float) + img[:, :, 2].astype(float)))
+    gimg = _LSIG.laser_signal(img)
     lit = gimg[gimg > gimg.max() * 0.15]
     binary = bool(len(lit) and (lit > gimg.max() * 0.9).mean() > 0.9)
     q_px = 0.5 / np.sqrt(12.0) * su if binary else None
@@ -576,25 +576,25 @@ def _median_depth(cap):
 
 def _remove_laser(rgb, ridge_thresh=8.0, grow=2, passes=4, med_size=15):
     """
-    사진에서 초록 레이저선만 지운다.
+    사진에서 레이저선만 지운다 (채널은 laser_signal 이 판별).
 
     검측 결과를 얹을 배경은 장면만 보이는 편이 낫다. 원본 격자가 남아
     있으면 검출점과 겹쳐 무엇이 결과인지 구분되지 않고, 이 내보내기의
     CAM.png 격자는 화면 등간격으로 그려져 있어 발사각을 따르는 검출점과
     애초에 겹치지도 않는다(간격 47.2~48.1px vs 실제 44~57px).
 
-    초록 과잉분 G − (R+B)/2 만으로는 못 가른다. 이 렌더는 장면 자체가
-    옅게 초록을 띠어(중앙값 6) 문턱을 어디에 두든 배경이 함께 잡히거나
-    흐린 선이 남는다. 대신 **얇은 능선**인지를 본다 — 초록 과잉분에서
-    그 지역 중앙값을 빼면 넓게 깔린 색조는 사라지고 폭 몇 화소짜리 선만
-    남는다. 창(med_size)은 선폭보다 충분히 커야 한다.
+    채널 과잉분만으로는 못 가른다. 이 렌더는 장면 자체가 옅게 초록을
+    띠어(중앙값 6) 문턱을 어디에 두든 배경이 함께 잡히거나 흐린 선이
+    남는다. 대신 **얇은 능선**인지를 본다 — 과잉분에서 그 지역 중앙값을
+    빼면 넓게 깔린 색조는 사라지고 폭 몇 화소짜리 선만 남는다.
+    창(med_size)은 선폭보다 충분히 커야 한다.
 
     잡은 자리는 주변 성한 화소의 평균으로 메운다. 창을 조금씩 키우며
     몇 번 돌린다. G 만 눌러 놓으면 회색 줄이 남는다 — 선 자리의 R·B 도
     이미 레이저 반사로 들떠 있기 때문이다.
     """
     a = np.asarray(rgb, float).copy()
-    g = a[:, :, 1] - 0.5 * (a[:, :, 0] + a[:, :, 2])
+    g = _LSIG.laser_signal(a)
     try:
         from scipy.ndimage import median_filter
         ridge = g - median_filter(g, size=int(med_size), mode="nearest")

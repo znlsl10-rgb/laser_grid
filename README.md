@@ -27,18 +27,34 @@
 ## 파이프라인
 
 ```
-1 shot = (rgb_off, rgb_on, IMU ĝ, calib)
- ├─[A ] 선검출        rgb_on  → {lid: [(u,v)…]}      A_선검출.py
- ├─[C ] 영역분할      rgb_off → label_map            C_영역분할.py
- ├─[eq7] 레이저 평면·삼각측량   → 선별 법선 n·이득 g·(X,Y,Z)  eq7_laser_plane.py
- │        (eq1 은 이 식의 특수해 — roll=0·tilt=0·V선. 규격 원식이자 회귀 기준)
- ├─[eq5] 영역 할당            → 침식·불연속 제거, 융합  eq5_region_assign.py
- └─ 영역별 검측                                       pipeline_region.py
-     벽·거푸집·조적  → eq2 평면(TLS) → eq3 수직도(중력) + eq4·eq6 평활도
-     바닥·슬래브     → eq2 평면(TLS) → eq3 수평도(중력) + eq4·eq6 평활도
-     동바리·기둥·철근 → eq2 축(RANSAC) → eq3 축 수직도(중력)  [평활도 N/A]
-     전 영역        → eq5 불확실도 → 합격 / 기준초과 / 측정불가 / 판정보류
+입력 = 레이저 이미지(필수) + camera_params.json·cast_pixels.json·IMU(선택)
+ │
+ ├─[신호]  laser_signal.py   채널(R/G/B)을 이미지에서 재서 고른다
+ ├─[A]     A_선검출.py        {lid: [(u,v)…]}        능선 추적
+ ├─[eq7]   eq7_laser_plane   선별 평면 법선 n → 이득 g → (X,Y,Z)
+ │           g = √(n_x²+n_y²)/|n_x| 가 '깊이를 줄 수 있는 선' 을 가른다
+ │           (eq1 은 이 식의 특수해 — roll=0·tilt=0·V선. 규격 원식·회귀 기준)
+ ├─[C]     C_영역분할.py       3D 점군 → 면/선형 분리 (다중평면 RANSAC)
+ ├─[eq5]   eq5_region_assign  점→영역 할당, 경계 정제, 의미×기하 융합
+ │
+ ├─ 면 부재 (벽·바닥·거푸집·슬래브)
+ │     eq2 평면(TLS) → eq3 수직도/수평도(중력) → eq4·eq6 평활도
+ ├─ 선형 부재 (동바리·기둥·철근)
+ │     eq2 축(RANSAC) → eq3 축 수직도(중력)   [평활도 정의 없음]
+ │     격자선 1줄만 걸리면 → eq8 로 옆 성분 복원, 안 되면 판정보류
+ │
+ └─ eq5 불확실도 → 합격 / 기준초과 / 측정불가 / 판정보류
+      ↓
+    엑셀 조서 11시트 + 세그멘테이션 이미지 + 3D 점군(부재별 색) + 좌표 CSV
 ```
+
+**면이냐 선형이냐** 는 점군 모양만으로 갈린다 — 설정값이 아니다. 갈리지
+않는 것은 **어느 검사를 걸 것인가**(수직도냐 수평도냐)로, 그건 장비 자세를
+알아야 정해진다. 그래서 `camera_params.json` 도 IMU 도 없이 돌리면 값은
+그대로 내되 판정은 **참고값(판정보류)** 으로 낮춘다. 실측에서 바닥 캡처를
+이미지만으로 돌렸을 때 `4.4594° 기준초과` 가 나왔는데, 같은 캡처에 사양
+파일을 함께 넣으면 `0.0390° 합격` 이다 — 부재가 기운 게 아니라 장비가
+숙여 있었을 뿐이다.
 
 **세로선(V)과 가로선(H)은 같은 식으로 푼다.** eq7 이 선을 발사각이 아니라
 레이저 평면 법선 n 으로 다루므로, 깊이가 풀리는지는 "V선인가 H선인가" 가
@@ -179,35 +195,46 @@ python3 experiment.py                            # 기선 x 거리 sweep
 
 ## 파일
 
+핵심만 남겼다. 연구용 스윕 스크립트와 Isaac Sim 전용 씬 빌더는 지웠다
+(`git show pre-cleanup-2026-08` 에서 볼 수 있다).
+
+### 검측 (입력 → 조서)
+
 | 파일 | 역할 |
 |---|---|
-| `1-1_build_inspection_lab_realistic.py` | USD 씬 + Semantics 라벨 + GT. StationA(벽·바닥) / StationB(평활도 패널) / **StationC_Mixed(벽+바닥+동바리 3본+철근 2본)** |
-| `inspection.py` | Isaac 촬영 → 선검출 → 시맨틱 마스크 → 영역별 검측 |
-| `A_선검출.py` | 20×20 격자 선검출 (v9). `multi_surface=True` 로 단일 평면 가정 해제 |
-| `C_영역분할.py` | 영역 분할. `gt`(Isaac Semantics) / `geom`(다중평면 RANSAC) / `sam`·`vlm`(미구현) |
-| `eq1_triangulation.py` | 능동 삼각측량 — 규격 원식 `Z=f·b/(f·tanα−(u−c_x))`. **파이프라인은 이 파일을 호출하지 않는다**: V선·roll 0 에서만 성립하고 β(가로선 각)를 받아 놓고 쓰지 않는다. eq7 의 정답 기준(회귀 [2])으로 남긴다 |
+| `colab_run.py` | **코랩 원클릭** — 저장소를 최신으로 맞추고, 올려 둔 파일에서 입력을 내용으로 가려 한 번에 돌린다 |
+| `run_pipeline.py` | **단일 입구** — 이미지(+사양·정답·IMU) → 엑셀 조서 하나 |
+| `laser_signal.py` | 사진에서 레이저만 남긴다. 채널(R/G/B)을 **이미지에서 재서** 고른다 — 초록으로 못박으면 빨간 레이저에서 통째로 실패한다 |
+| `A_선검출.py` | 격자 선검출. 능선 추적 + 굴린 격자 계열 분리 |
+| `C_영역분할.py` | 영역 분할. `geom`(다중평면 RANSAC) / `gt`(정답 라벨) |
+| `pipeline_region.py` | 영역별 검측 오케스트레이션 — 면/선형 분기, 판정 |
+| `load_capture.py` | raycast 내보내기 폴더(이미지+json) → 검측 + 선검출 정확도 대조 |
+| `calibration.py` | 사양 프로파일 단일 출처 (legacy / pdf / improved / diagonal) |
+| `synth_scene.py` | 해석적 합성 씬 — 회귀 검증의 정답 생성기 |
+
+### 식 (eq1~eq8)
+
+| 파일 | 역할 |
+|---|---|
+| `eq1_triangulation.py` | 규격 원식 `Z=f·b/(f·tanα−(u−c_x))`. **파이프라인은 호출하지 않는다** — V선·roll 0 에서만 성립하고 β(가로선 각)를 받아 놓고 쓰지 않는다. eq7 의 정답 기준(회귀 [2])으로 남긴다 |
 | `eq2_plane_fit.py` | TLS 평면적합, PCA·RANSAC 축적합, 면내 좌표계 |
 | `eq3_orientation.py` | **중력 기준** 수직도·수평도·부재 수직도, KCS 판정 |
 | `eq4_flatness_line.py` | 요철 위치·깊이 (면내 격자) |
 | `eq5_region_assign.py` | 점→영역 할당, 경계 정제, 의미×기하 융합, 불확실도 |
 | `eq6_straightedge.py` | **KCS 직선자 평활도 판정** + 분해능 편향 진단 |
-| `eq7_laser_plane.py` | **레이저 평면 일반화 + 실제 삼각측량 경로** — 평면 법선 n 하나로 V·H·굴린 격자를 한 식에. 깊이 이득 `g=√(n_x²+n_y²)/\|n_x\|` 가 '이 선이 깊이를 줄 수 있는가' 를 가른다(roll 0 의 가로선은 g=∞ → 배제) |
-| `eq8_silhouette.py` | **옆(레이저 평면 수직) 기울기 복원** — 세로선 한 줄이 원리적으로 못 보는 성분을 부재 그림자에서 되찾는다. 단서 두 가지: ① 검출된 **가로선 화소의 끊김**(`axis_from_line_gaps`, 부재 지름·중심도 함께 나온다) ② 원신호 그림자 스캔(`resolve_member`, ①이 실패할 때). 실측 3본 중 ①이 1본, ②가 2본을 살렸다 |
-| `calibration.py` | 사양 프로파일 단일 출처 (legacy / pdf / improved / diagonal) |
-| `load_capture.py` | Isaac raycast 내보내기 폴더 → 검측 + 선검출 정확도 대조 |
-| `inspect_png.py` | 단일 이미지 검측 + 격자·사양 교차확인 |
-| `plot_points3d.py` | **3D 점군 시각화(부재 구분 반영)** — matplotlib 등척 3D 산점도. 부재별 색·요철 표시·4분할(등각/평면/정면/측면). 이미지·캡처폴더·3D좌표 CSV·`xyz_result.json` 을 받는 CLI 겸용 |
+| `eq7_laser_plane.py` | **레이저 평면 일반화 + 실제 삼각측량 경로**. 평면 법선 n 하나로 V·H·굴린 격자를 한 식에. 이득 `g=√(n_x²+n_y²)/\|n_x\|` 가 '이 선이 깊이를 줄 수 있는가' 를 가른다 |
+| `eq8_silhouette.py` | **옆(레이저 평면 수직) 기울기 복원**. 세로선 한 줄이 원리적으로 못 보는 성분을 부재 그림자에서 되찾는다 — ① 가로선 화소의 끊김 ② 원신호 그림자 스캔 |
+
+### 산출
+
+| 파일 | 역할 |
+|---|---|
+| `plot_points3d.py` | **3D 점군 시각화(부재 구분 반영)** — matplotlib 등척 3D 산점도. 부재별 색·요철 표시·4분할. CLI 겸용 |
+| `report.py` | 검측 조서(JSON) + 요약 표 + 세그멘테이션 이미지 |
 | `report_excel.py` | 엑셀 조서 11시트 |
-| `experiment_roll.py` | 격자 회전각(roll) 스캔 — 각도 정확도 ↔ 평활도 교환비 |
-| `experiment_spec.py` | 사양 프로파일 정확도 비교 |
-| `run_pipeline.py` | **단일 입구** — 이미지 한 장 → 엑셀 조서 하나 |
-| `colab.ipynb` | 코랩 노트북 (설치 → 업로드 → 실행 → 내려받기) |
-| `pipeline_region.py` | 영역별 검측 오케스트레이션 |
-| `report.py` | 검측 조서(JSON) + 요약 표 + 오버레이 이미지 |
-| `synth_scene.py` | Isaac 없이 도는 해석적 다중면 합성 씬 |
-| `experiment.py` | 기선 × 측정거리 sweep (Isaac) |
-| `experiment_segmentation.py` | 세그멘테이션 품질 → 검측 정확도 오차 분해 |
-| `tests/test_regression.py` | 전체 회귀 검증 |
+| `colab.ipynb` | 코랩 노트북 |
+| `tests/test_regression.py` | 전체 회귀 검증 (18묶음) |
+
 
 ---
 

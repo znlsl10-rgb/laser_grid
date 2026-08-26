@@ -18,6 +18,16 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 
+def _load_test(name):
+    """tests/ 안의 도우미 모듈."""
+    spec = ilu.spec_from_file_location(
+        name, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           f"{name}.py"))
+    m = ilu.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
 def _load(name):
     spec = ilu.spec_from_file_location(name, os.path.join(ROOT, f"{name}.py"))
     m = ilu.module_from_spec(spec); spec.loader.exec_module(m)
@@ -363,7 +373,7 @@ def test_region_pipeline():
 def test_segmentation_robustness():
     """세그멘테이션이 훼손돼도 각도 판정이 유지되는지"""
     print("\n[8] 세그멘테이션 훼손 강건성")
-    EXP = _load("experiment_segmentation")
+    EXP = _load_test("scene_perturb")
     scene = SYN.build_scene()
     gt = scene["gt"]
     want = {"wall": "wall_verticality_deg",

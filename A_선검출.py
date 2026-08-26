@@ -64,6 +64,7 @@ def _load(_name):
 
 # 굴린 격자(roll)에서는 선이 이미지에서 기울어 예측식이 달라진다.
 _EQ7 = _load("eq7_laser_plane")
+_LSIG = _load("laser_signal")
 try:
     from scipy.optimize import curve_fit as _curve_fit
     _SCIPY = True
@@ -155,19 +156,14 @@ def detect(rgb_image, lines_pixels_raycast, line_angles, camera_params,
               for lid in h_lids}
 
     # ── Step1: 신호 분리 ─────────────────────────────────────────────
-    # [방안4] laser_off_image 있으면 차영상(ON-OFF)으로 배경광 제거,
-    #         없으면 기존 초록채널 분리(G - avg(R,B)).
+    # 채널은 **이미지에서 재서** 고른다(laser_signal). 초록으로 못박아 두면
+    # 빨간 레이저(635·650nm)에서 G−(R+B)/2 가 음수가 되어 신호가 통째로
+    # 0 으로 잘리고, 아래 "신호 없음 → 기하 예측값" 으로 조용히 빠진다.
+    # laser_off_image 가 있으면 차영상으로 배경광까지 지운다.
     img = rgb_image.astype(np.float32)
-    if laser_off_image is not None:
-        # 차영상: 배경광은 두 프레임에 공통 → 차분 시 제거, 레이저만 남음
-        off = laser_off_image.astype(np.float32)
-        d_on  = img[:,:,1] - (img[:,:,0] + img[:,:,2]) / 2.0
-        d_off = off[:,:,1] - (off[:,:,0] + off[:,:,2]) / 2.0
-        diff  = np.clip(d_on - d_off, 0, None)
-        _sig_mode = "차영상(ON-OFF)"
-    else:
-        diff = np.clip(img[:,:,1] - (img[:,:,0] + img[:,:,2]) / 2.0, 0, None)
-        _sig_mode = "초록채널"
+    diff, _sig = _LSIG.laser_signal(img, off=laser_off_image, clip=True,
+                                    info=True)
+    _sig_mode = _sig["mode"]
     if diff.max() < 1.0:
         print("  [A] 신호 없음 → 기하 예측값 반환")
         return _fallback_geom(v_lids, h_lids, camera_params, H_img, W_img,
