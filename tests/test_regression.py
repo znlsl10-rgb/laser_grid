@@ -610,10 +610,10 @@ def test_pointcloud_export():
     byc = {d["클래스"]: d for d in summ}
     if "wall" in byc and "floor" in byc:
         w, fl = byc["wall"], byc["floor"]
-        check(f"벽은 높이폭 {w['높이폭_m']}m > 깊이폭 {w['깊이폭_m']}m (서 있다)",
-              w["높이폭_m"] > w["깊이폭_m"])
-        check(f"바닥은 깊이폭 {fl['깊이폭_m']}m > 높이폭 {fl['높이폭_m']}m (누워 있다)",
-              fl["깊이폭_m"] > fl["높이폭_m"])
+        check(f"벽은 측정구간 {w['측정구간_m']}m > 깊이폭 {w['깊이폭_m']}m (서 있다)",
+              w["측정구간_m"] > w["깊이폭_m"])
+        check(f"바닥은 깊이폭 {fl['깊이폭_m']}m > 측정구간 {fl['측정구간_m']}m (누워 있다)",
+              fl["깊이폭_m"] > fl["측정구간_m"])
     rows = REPORT.region_xyz_rows(res, g_hat=sc["g_hat"], stride=50)
     check(f"좌표 표 {len(rows):,}행 — 부재 구분 열 포함",
           len(rows) > 0 and "클래스" in rows[0] and "높이_m" in rows[0])
