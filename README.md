@@ -9,6 +9,12 @@
 
 ---
 
+## 코랩에서 바로 돌리기
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/znlsl10-rgb/laser_grid/blob/main/colab.ipynb)
+
+레이저 격자 이미지 하나만 있으면 엑셀 조서가 나온다. IMU·정답값·장면 사진은 있으면 넣고 없으면 비워 둔다.
+
 ## 파이프라인
 
 ```
