@@ -73,6 +73,7 @@ EQ7 = _load("eq7_laser_plane")
 DETECT = _load("A_선검출")
 PIPE = _load("pipeline_region")
 REPORT = _load("report")
+PLOT3D = _load("plot_points3d")
 XLS = _load("report_excel")
 LC = _load("load_capture")
 
@@ -799,9 +800,16 @@ def _outputs(out_dir, name, res, g_hat, base, shape, uv_tf, pc_stride, say):
     except Exception as e:
         say(f"    [경고] 세그멘테이션 그림 실패: {e}")
     try:
-        imgs["3D점군"] = REPORT.save_pointcloud_3d(
+        # 축척·눈금이 있는 matplotlib 판을 먼저 시도한다. 등척 3D 에 실제
+        # 미터 눈금이 붙어 있어야 "이 벽이 정말 수직인가" 를 눈으로 잰다.
+        # matplotlib 이 없으면 의존성 없는 PIL 판으로 내려간다.
+        imgs["3D점군"] = PLOT3D.save_pointcloud_mpl(
             _os.path.join(out_dir, f"{name}_3D점군.png"), res, g_hat,
             title=f"3D 점군 — {name}")
+        if not imgs["3D점군"]:
+            imgs["3D점군"] = REPORT.save_pointcloud_3d(
+                _os.path.join(out_dir, f"{name}_3D점군.png"), res, g_hat,
+                title=f"3D 점군 — {name}")
         imgs["3D좌표csv"] = REPORT.save_pointcloud_csv(
             _os.path.join(out_dir, f"{name}_3D좌표.csv"), res,
             g_hat=g_hat, stride=max(1, int(pc_stride)))

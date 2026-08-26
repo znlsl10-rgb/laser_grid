@@ -959,6 +959,80 @@ def test_line_gap_recovery():
     check("깊이차가 없으면 되살리지 않는다", not bad.get("ok"))
 
 
+def test_pointcloud_plot():
+    """[17] 3D 점군 그림 — 부재 구분이 색으로 반영되는가"""
+    print("\n[17] 3D 점군 시각화 (plot_points3d)")
+    try:
+        import matplotlib                                    # noqa: F401
+    except ImportError:
+        print("  [건너뜀] matplotlib 없음 — PIL 판으로 폴백됨")
+        return
+    P3 = _load("plot_points3d")
+    g = np.array([0.0, 1.0, 0.0])
+    rng = np.random.default_rng(11)
+
+    def region(cls, kind, c, n=300, aux=0):
+        P = rng.normal(0, 0.02, (n, 3)) + np.asarray(c, float)
+        r = {"class": cls, "kind": kind, "status": "measured",
+             "point_xyz": P, "point_lid": np.array([f"V{i%3}" for i in range(n)],
+                                                   dtype=object),
+             "judge": {"is_pass": True}, "flatness": {}}
+        if aux:
+            r["aux_point_xyz"] = rng.normal(0, 0.02, (aux, 3)) \
+                + np.asarray(c, float)
+        return r
+
+    res = {"regions": [region("wall", "plane_vertical", (0, 0, 2.5), 400, 200),
+                       region("shoring", "axis_vertical", (-0.5, 0, 1.6), 300, 90),
+                       region("shoring", "axis_vertical", (0.5, 0, 1.6), 300, 70)]}
+
+    gs = P3.groups_from_result(res, g_hat=g, by="member")
+    labels = [x["label"] for x in gs]
+    check(f"부재별 묶음 {len(gs)}개 (측정 3 + 가로선 3)", len(gs) == 6)
+    check("같은 종류 부재는 번호로 갈린다 — 엑셀 9번 시트와 같은 번호",
+          any("shoring #2" in l for l in labels)
+          and any("shoring #3" in l for l in labels))
+    cols = [tuple(np.round(x["color"], 4)) for x in gs if not x["aux"]]
+    check(f"부재마다 색이 다르다 ({len(set(cols))}/3)", len(set(cols)) == 3)
+    aux = [x for x in gs if x["aux"]]
+    check("가로선 점은 '투영' 으로 표시된다",
+          len(aux) == 3 and all("투영" in x["label"] for x in aux))
+
+    n_meas = sum(len(x["xyz"]) for x in gs if not x["aux"])
+    check(f"솎지 않는다 — 측정점 {n_meas}개 전부", n_meas == 1000)
+    n_str = sum(len(x["xyz"]) for x in P3.groups_from_result(
+        res, g_hat=g, by="member", stride=10) if not x["aux"])
+    check(f"stride=10 이면 {n_str}개로 준다", n_str == 100)
+
+    gl = P3.groups_from_result(res, g_hat=g, by="line")
+    check(f"--by line 이면 레퍼런스와 같은 V·H 색칠 ({len(gl)}묶음)",
+          len(gl) == 2 and {x["color"] for x in gl}
+          == {"tab:blue", "tab:red"})
+
+    # frame 은 좌표를 바꾼다 — camera 는 삼각측량이 낸 값 그대로,
+    # gravity 는 중력 정렬(가로·깊이·높이). 섞이면 벽이 기울어 보인다.
+    raw = np.asarray(res["regions"][0]["point_xyz"], float)
+    cam = P3.groups_from_result(res, g_hat=g, by="member",
+                                frame="camera")[0]["xyz"]
+    grv = P3.groups_from_result(res, g_hat=g, by="member",
+                                frame="gravity")[0]["xyz"]
+    check("frame=camera 는 삼각측량 좌표 그대로", np.allclose(cam, raw))
+    check("frame=gravity 는 중력 정렬 좌표 — 깊이축이 Z 에서 분리된다",
+          not np.allclose(grv, raw)
+          and abs(np.ptp(grv[:, 1]) - np.ptp(raw[:, 2])) < 1e-9)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        out = os.path.join(td, "pc.png")
+        got = P3.save_pointcloud_mpl(out, res, g_hat=g, title="검증")
+        check(f"그림 파일이 나온다 ({os.path.getsize(out) // 1024}KB)"
+              if got else "그림 파일이 나온다",
+              got == out and os.path.getsize(out) > 20_000)
+        out2 = os.path.join(td, "pc_iso.png")
+        check("views=iso 도 나온다",
+              P3.save_pointcloud_mpl(out2, res, g_hat=g, views="iso") == out2)
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -970,7 +1044,8 @@ def main():
               test_eq7_laser_plane, test_h_lines_in_pipeline,
               test_pointcloud_export, test_rolled_grid_detection,
               test_run_pipeline_inputs, test_single_line_member,
-              test_silhouette_recovery, test_line_gap_recovery):
+              test_silhouette_recovery, test_line_gap_recovery,
+              test_pointcloud_plot):
         t()
     print("\n" + "=" * 70)
     if _FAILS:

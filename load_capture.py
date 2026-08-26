@@ -60,6 +60,7 @@ _EQ7 = _load("eq7_laser_plane")
 # 혼동될 여지 없이 "찾았다/못 찾았다" 를 가른다.
 MATCH_TOL_PX = 5.0
 REPORT = _load("report")
+PLOT3D = _load("plot_points3d")
 XLS = _load("report_excel")
 
 
@@ -1212,9 +1213,14 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
     # 곧 검측이 맞았는지다.
     pc3d = pc_csv = None
     try:
-        pc3d = REPORT.save_pointcloud_3d(
+        # 축척·눈금이 있는 matplotlib 판 우선, 없으면 PIL 판으로 폴백
+        pc3d = PLOT3D.save_pointcloud_mpl(
             os.path.join(out_dir, f"{name}_3D점군.png"), res, cap["g_hat"],
             title=f"3D 점군 — {name}")
+        if not pc3d:
+            pc3d = REPORT.save_pointcloud_3d(
+                os.path.join(out_dir, f"{name}_3D점군.png"), res,
+                cap["g_hat"], title=f"3D 점군 — {name}")
         pc_csv = REPORT.save_pointcloud_csv(
             os.path.join(out_dir, f"{name}_3D좌표.csv"), res,
             g_hat=cap["g_hat"], stride=max(1, int(pc_stride)))

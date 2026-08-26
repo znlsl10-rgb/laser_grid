@@ -6,6 +6,7 @@
 numpy>=1.24
 Pillow>=10.0          # 세그멘테이션 이미지·오버레이 렌더
 openpyxl>=3.1         # 엑셀 조서 (report_excel.py)
+matplotlib>=3.7       # 축척 있는 3D 점군 그림 (plot_points3d.py)
 
 # 선택 — 없으면 해당 단계가 성능이 떨어지거나 폴백으로 동작한다
 scikit-learn>=1.3     # geom 백엔드의 DBSCAN 공간 분리

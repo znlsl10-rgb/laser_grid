@@ -181,7 +181,8 @@ python3 experiment.py                            # 기선 x 거리 sweep
 | `calibration.py` | 사양 프로파일 단일 출처 (legacy / pdf / improved / diagonal) |
 | `load_capture.py` | Isaac raycast 내보내기 폴더 → 검측 + 선검출 정확도 대조 |
 | `inspect_png.py` | 단일 이미지 검측 + 격자·사양 교차확인 |
-| `report_excel.py` | 엑셀 조서 10시트 |
+| `plot_points3d.py` | **3D 점군 시각화(부재 구분 반영)** — matplotlib 등척 3D 산점도. 부재별 색·요철 표시·4분할(등각/평면/정면/측면). 이미지·캡처폴더·3D좌표 CSV·`xyz_result.json` 을 받는 CLI 겸용 |
+| `report_excel.py` | 엑셀 조서 11시트 |
 | `experiment_roll.py` | 격자 회전각(roll) 스캔 — 각도 정확도 ↔ 평활도 교환비 |
 | `experiment_spec.py` | 사양 프로파일 정확도 비교 |
 | `run_pipeline.py` | **단일 입구** — 이미지 한 장 → 엑셀 조서 하나 |
