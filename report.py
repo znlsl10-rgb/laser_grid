@@ -50,7 +50,9 @@ CLASS_COLOR = {"wall": (60, 130, 246), "formwork_wall": (99, 102, 241),
 # 요철 표시색 — 부재 색 어느 것과도 겹치지 않는 자홍
 DEFECT_COLOR = (236, 72, 153)
 VERDICT_COLOR = {"합격": (34, 197, 94), "기준초과": (239, 68, 68),
-                 "측정불가": (148, 163, 184), "판정보류(분해능)": (234, 179, 8)}
+                 "측정불가": (148, 163, 184), "판정보류(분해능)": (234, 179, 8),
+                 "판정보류(노출길이)": (234, 179, 8),
+                 "판정보류(단면 미분해)": (234, 179, 8)}
 
 # 오버레이 범례용 ASCII 대체 표기.
 # PIL 기본 비트맵 폰트에는 한글이 없어 □ 로 찍힌다. 한글 TTF 를 찾으면
@@ -63,7 +65,9 @@ CLASS_EN = {"wall": "Wall", "formwork_wall": "Formwork(Wall)",
 KIND_EN = {"plane_vertical": "verticality", "plane_horizontal": "horizontality",
            "axis_vertical": "axis-verticality"}
 VERDICT_EN = {"합격": "PASS", "기준초과": "FAIL", "측정불가": "N/M",
-              "판정보류(분해능)": "HOLD", "해당없음": "n/a"}
+              "판정보류(분해능)": "HOLD",
+              "판정보류(노출길이)": "HOLD",
+              "판정보류(단면 미분해)": "HOLD", "해당없음": "n/a"}
 
 # 배포 환경(윈도우/리눅스 워크스테이션)에 흔한 한글 폰트 경로
 _KOREAN_FONT_CANDIDATES = [
@@ -169,7 +173,10 @@ def build_record(result, meta=None):
 
         j = r.get("judge") or {}
         item["측정각도_deg"] = r.get("theta_deg")
-        item["판정"] = "합격" if j.get("is_pass") else "기준초과"
+        # judgement 가 최종 표기다. is_pass 만 보면 "판정을 하지 않음"
+        # (is_pass=None) 이 "기준초과" 로 뒤바뀐다.
+        item["판정"] = j.get("judgement") or ("합격" if j.get("is_pass")
+                                            else "기준초과")
         item["기준"] = ({"방식": "mm", "편차_mm": j.get("deviation_mm"),
                         "허용_mm": j.get("allow_mm"),
                         "부재길이_m": j.get("member_length_m"),
@@ -378,7 +385,7 @@ def save_segmentation(path, result, base_image=None, shape=None,
     d = ImageDraw.Draw(im)
     rad = point_px if point_px else max(2, int(round(W / 700.0)))
 
-    counts, aux_counts = {}, {}
+    counts, aux_counts, one_line = {}, {}, {}
     # 깊이를 못 주는 선(가로선)의 점을 **먼저** 깔고 그 위에 측정점을 얹는다.
     # 겹치는 자리에서는 측정점이 보여야 한다.
     for r in result.get("regions", []):
@@ -404,8 +411,14 @@ def save_segmentation(path, result, base_image=None, shape=None,
         if r.get("status") != "measured":
             col = tuple(int(c * 0.45) for c in col)     # 기각 영역은 어둡게
         counts[cls] = counts.get(cls, 0) + len(uv)
+        if r.get("single_plane") or r.get("n_lines") == 1:
+            one_line[cls] = one_line.get(cls, 0) + 1
+        # 격자선 한 줄짜리 부재는 점이 가늘어 눈에 안 띈다. 굵게 찍어
+        # "여기 부재가 있다" 는 것이 보이게 한다 — 판정은 보류지만
+        # 검출은 됐다는 사실이 그림에서 읽혀야 한다.
+        pr = rad + 1 if (r.get("single_plane") or r.get("n_lines") == 1) else rad
         for u, v in _tf(uv):
-            d.ellipse([u - rad, v - rad, u + rad, v + rad], fill=col)
+            d.ellipse([u - pr, v - pr, u + pr, v + pr], fill=col)
 
     # ── 요철 위치 ──
     fsize = max(14, int(round(H / 48.0)))
@@ -458,11 +471,15 @@ def save_segmentation(path, result, base_image=None, shape=None,
     for c, n in sorted(counts.items(), key=lambda kv: -kv[1]):
         a = aux_counts.get(c, 0)
         nm = CLASS_KO.get(c, c) if ko else CLASS_EN.get(c, c)
+        ol = one_line.get(c, 0)
         rows.append((CLASS_COLOR.get(c, (200,) * 3),
                      (f"{nm}  ({c}, 측정 {n:,}점"
-                      + (f" + 가로 {a:,}점" if a else "") + ")") if ko
+                      + (f" + 가로 {a:,}점" if a else "")
+                      + (f", {ol}본은 격자선 1줄 → 판정보류" if ol else "")
+                      + ")") if ko
                      else f"{nm} ({c}, {n} pts"
-                          + (f" +{a} aux" if a else "") + ")"))
+                          + (f" +{a} aux" if a else "")
+                          + (f", {ol} single-line" if ol else "") + ")"))
     if sum(aux_counts.values()):
         rows.append(((110, 110, 118),
                      "어두운 점 = 가로선 (깊이는 면에서 빌림, 검측 제외)" if ko
@@ -558,7 +575,9 @@ def save_overlay(path, result, table_uv=None, label_map=None,
         if r["status"] != "measured":
             continue
         cls = r["class"]
-        vd = "합격" if (r.get("judge") or {}).get("is_pass") else "기준초과"
+        _j = r.get("judge") or {}
+        vd = _j.get("judgement") or ("합격" if _j.get("is_pass")
+                                     else "기준초과")
         f = r.get("flatness") or {}
         if ko:
             txt = (f"{CLASS_KO.get(cls, cls)} {KIND_KO.get(r['kind'], '')} "
@@ -762,7 +781,7 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
     canvas = np.full((H, W, 3), 16, np.uint8)
 
     # 부재별 점·색
-    Ps, Cs, counts, aux_counts = [], [], {}, {}
+    Ps, Cs, counts, aux_counts, one_line = [], [], {}, {}, {}
     for r in regs:
         p = np.asarray(r["point_xyz"], float)
         if len(p) > max_points_per_region:      # 그림만 성기게, 통계는 전부
@@ -775,6 +794,8 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
         Ps.append(p @ R)
         Cs.append(np.repeat(col[None, :], len(p), axis=0))
         counts[cls] = counts.get(cls, 0) + int(len(r["point_xyz"]))
+        if r.get("single_plane") or r.get("n_lines") == 1:
+            one_line[cls] = one_line.get(cls, 0) + 1
 
         # 가로선 점 — 면에서 거리를 빌려 온 유도값이다. 같은 부재 색을
         # 옅게 써서 "어디에 걸렸는지" 는 보이되 측정점과 구분되게 한다.
@@ -914,10 +935,13 @@ def save_pointcloud_3d(path, result, g_hat, size=(1900, 1500), title=None,
         a = aux_counts.get(cls, 0)
         d.rectangle([16, y + 4, 16 + fs, y + fs], fill=col)
         nm = (CLASS_KO.get(cls, cls) if ko else CLASS_EN.get(cls, cls))
+        ol = one_line.get(cls, 0)
         _txt((16 + fs * 2, y),
              (f"{nm}  ({cls}, 측정 {n:,}점"
-              + (f" + 가로 {a:,}점" if a else "") + ")") if ko
-             else f"{nm} ({cls}, {n} pts" + (f" +{a} aux" if a else "") + ")")
+              + (f" + 가로 {a:,}점" if a else "")
+              + (f", {ol}본은 격자선 1줄 → 판정보류" if ol else "") + ")") if ko
+             else f"{nm} ({cls}, {n} pts" + (f" +{a} aux" if a else "")
+                  + (f", {ol} single-line" if ol else "") + ")")
         y += int(fs * 1.9)
     if sum(aux_counts.values()):
         _txt((16 + fs * 2, y),
@@ -1021,6 +1045,9 @@ def region_xyz_summary(result, g_hat=None):
             "점수": int(len(P)),
             "가로선점수": int(len(r["aux_point_xyz"])
                        if r.get("aux_point_xyz") is not None else 0),
+            "선수": r.get("n_lines"),
+            "구간제한": bool(r.get("extent_limited")),
+            "선형부재": bool(r.get("kind") == "axis_vertical"),
             "선구성": (" / ".join(f"{k} {v:,}점" for k, v in sorted(fams.items()))
                     or None),
             "깊이이득_RMS": r.get("depth_gain_rms"),

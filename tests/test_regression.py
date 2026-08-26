@@ -772,6 +772,52 @@ def test_run_pipeline_inputs():
         CALIB.use_profile(keep)
 
 
+def test_single_line_member():
+    """[14] 격자선 한 줄만 걸린 부재는 합격을 못 준다"""
+    print("\n[14] 단면 미분해 — 한 줄짜리 부재")
+    rng = np.random.default_rng(3)
+    g = np.array([0.0, 1.0, 0.0])
+    cp = {"f_px": 1593.0, "b_m": 0.15, "cx_px": 1224.0, "cy_px": 1024.0,
+          "image_w": 2448, "image_h": 2048}
+
+    # 레이저 평면 한 장 위의 연직선 — 실제 동바리를 한 줄이 스친 모습
+    y = np.linspace(-1.0, 1.0, 600)
+    one = np.column_stack([np.full_like(y, -0.77), y, np.full_like(y, 1.70)])
+    r = PIPE.measure_region(one, "shoring", g, cp, n_lines=1)
+    j = r.get("judge") or {}
+    check(f"한 줄 → 판정 '{j.get('judgement')}' (합격 아님)",
+          j.get("judgement") == "판정보류(단면 미분해)"
+          and j.get("is_pass") is not True,
+          f"측정 {r.get('theta_deg')}°")
+    check("한 줄 표시가 결과에 남는다", r.get("single_plane") is True)
+
+    # 평면에 **수직인** 기울기는 한 줄로는 안 보인다 — 그래서 합격 금지다
+    tilt = np.radians(2.0)
+    two = one.copy()
+    two[:, 0] += np.sin(tilt) * (y - y.mean())      # 평면 밖으로 눕힌다
+    th_true = np.degrees(np.arccos(abs(
+        np.dot(np.array([np.sin(tilt), np.cos(tilt), 0.0]), g))))
+    proj = one.copy()                              # 한 줄이 보는 것은 이것뿐
+    r2 = PIPE.measure_region(proj, "shoring", g, cp, n_lines=1)
+    check(f"실제 {th_true:.2f}° 기울어도 한 줄에서는 "
+          f"{r2['theta_deg']:.4f}° 로 보인다 — 그래서 합격 금지가 맞다",
+          abs(r2["theta_deg"]) < 0.01 and th_true > 1.0)
+
+    # 두 줄 이상이면 정상 판정으로 돌아온다
+    t = np.linspace(-1.0, 1.0, 600)
+    axis = np.array([np.sin(np.radians(0.3)), np.cos(np.radians(0.3)), 0.0])
+    ph = rng.uniform(-np.pi, np.pi, 600)
+    cyl = (np.outer(t, axis)
+           + 0.0243 * np.column_stack([np.cos(ph), np.zeros(600), np.sin(ph)])
+           + np.array([0.2, 0.0, 1.6]))
+    r3 = PIPE.measure_region(cyl, "shoring", g, cp, n_lines=3)
+    j3 = r3.get("judge") or {}
+    check(f"세 줄 걸린 부재 → '{j3.get('judgement')}' "
+          f"({r3['theta_deg']:.3f}°, 정답 0.3°)",
+          j3.get("judgement") != "판정보류(단면 미분해)"
+          and abs(r3["theta_deg"] - 0.3) < 0.5)
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -782,7 +828,7 @@ def main():
               test_segmentation_robustness, test_boundary_rejection,
               test_eq7_laser_plane, test_h_lines_in_pipeline,
               test_pointcloud_export, test_rolled_grid_detection,
-              test_run_pipeline_inputs):
+              test_run_pipeline_inputs, test_single_line_member):
         t()
     print("\n" + "=" * 70)
     if _FAILS:

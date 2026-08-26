@@ -201,7 +201,7 @@ def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):
 
 def measure_region(points_3d, cls, g_hat, camera_params,
                    flatness_threshold_mm=1.5, sigma_u_px=0.2,
-                   target_sigma_mm=2.0, member_length_m=None):
+                   target_sigma_mm=2.0, member_length_m=None, n_lines=None):
     """
     한 영역의 3D 점군에 클래스에 맞는 검측식을 적용한다.
 
@@ -256,6 +256,40 @@ def measure_region(points_3d, cls, g_hat, camera_params,
             # 적용할 KCS 허용치도 고를 수 없다. 조서 비고에 남긴다.
             j["note"] = ((j.get("note") + " / ") if j.get("note") else "") \
                 + ax["note"]
+        # ── 격자선 한 줄만 걸린 부재는 각도를 "잰" 것이 아니다 ──
+        # 한 줄에서 나온 3D 점은 삼각측량의 정의상 **그 레이저 평면 안**에
+        # 놓인다. 그러면 축 적합이 찾는 것은 부재의 축이 아니라 부재
+        # 표면과 그 평면의 교선이고, 교선은 평면 안에서만 기울 수 있다.
+        #
+        #   · 평면 안 기울기  → 보인다
+        #   · 평면에 수직인 기울기 → **전혀 안 보인다**
+        #
+        # 즉 나온 각도는 참 기울기의 한 성분일 뿐이고 참값은 항상 그보다
+        # 크거나 같다(두 성분이 제곱합이므로). 이걸 합격으로 내주면,
+        # 안 보이는 성분이 허용치를 넘어도 합격이 된다. 실측에서 동바리
+        # 세 본이 전부 "수직도 0.0000° 합격" 으로 나왔는데, 그 0 은
+        # 측정값이 아니라 기하의 결과였다.
+        single_plane = (n_lines is not None and n_lines <= 1) or (
+            not ax.get("cross_section_resolved", True)
+            and float(ax.get("radius_est_mm") or 0.0) <= 1e-6)
+        out["single_plane"] = bool(single_plane)
+        out["n_lines"] = (int(n_lines) if n_lines is not None else None)
+        if single_plane:
+            j["is_pass"] = None
+            j["judgement"] = "판정보류(단면 미분해)"
+            j["cross_section_resolved"] = False
+            j["measured_component"] = "레이저 평면 안 성분만"
+            j["note"] = (
+                (j.get("note") + " / " if j.get("note") else "")
+                + f"격자선이 한 줄만 걸렸다"
+                + (f"(선 {int(n_lines)}개)" if n_lines is not None else "")
+                + f". 한 줄에서 나온 점은 그 레이저 평면 안에 놓이므로, "
+                  f"잰 {theta:.4f}° 는 **평면 안 성분**일 뿐이고 평면에 "
+                  f"수직인 기울기는 보이지 않는다. 참 기울기는 이 값보다 "
+                  f"크거나 같다 — 합격 판정을 내릴 수 없다. 부재에 격자선이 "
+                  f"두 줄 이상 걸리도록 더 가까이서 찍거나 격자를 조밀하게 "
+                  f"할 것")
+
         if unc is not None:
             j["angle_uncertainty_deg"] = unc
             j["slenderness"] = ax.get("slenderness")
@@ -603,10 +637,12 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
                 gs = gs[np.isfinite(gs)]
                 if len(gs):
                     g_rms = float(np.sqrt(np.mean(gs ** 2)))
+            n_lines = int(len(set(str(x) for x in table["lid"][keep])))
             r = measure_region(pts, final_cls, g_hat, camera_params,
                                flatness_threshold_mm=flatness_threshold_mm,
                                sigma_u_px=sigma_u_px * g_rms,
-                               target_sigma_mm=target_sigma_mm)
+                               target_sigma_mm=target_sigma_mm,
+                               n_lines=n_lines)
             r["depth_gain_rms"] = round(g_rms, 3)
             r["region_id"] = int(reg["class_id"])
             r["label_fusion"] = {k: v for k, v in fu.items() if k != "note"}
@@ -621,6 +657,19 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
             # 않는다(선형 정제로 걸러낸 점은 여기에도 없다).
             r["point_xyz"] = pts
             r["point_lid"] = table["lid"][keep]
+            r["n_lines"] = n_lines
+            # 화면 가장자리에 닿았으면 이 부재의 크기는 **하한** 이다.
+            # 부재가 거기서 끝난 것이 아니라 화면이 끝난 것이라, 그 값을
+            # 부재 길이로 읽으면 안 된다. 실측에서 동바리 세 본의 "높이"가
+            # 1.99/1.93/1.87m 로 달랐는데, 거리에 정확히 비례한 값이었다 —
+            # 셋 다 화면에 잘린 같은 화소 구간이었을 뿐이다.
+            # 경계는 이미지 테두리가 아니라 **격자가 실제로 닿은 범위**로
+            # 잰다. 추적은 신호가 있는 구간만 훑으므로 화면 끝까지 가지
+            # 않는 경우가 흔하고, 그때도 부재는 그 너머로 이어진다.
+            r["point_uv_box"] = [float(table["uv"][keep][:, 0].min()),
+                                 float(table["uv"][keep][:, 1].min()),
+                                 float(table["uv"][keep][:, 0].max()),
+                                 float(table["uv"][keep][:, 1].max())]
             results.append(r)
 
     # 깊이를 못 주는 선(가로선)의 화소도 결과 그림에는 나와야 한다.
@@ -631,6 +680,24 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
             n_aux = place_aux_points(results, aux_lines_uv, camera_params)
         except Exception:
             n_aux = 0
+
+    # 각 영역의 끝이 "부재의 끝" 인지 "격자가 닿은 데까지" 인지 가른다.
+    # 셋 다 같은 화소 구간을 훑었는데 거리가 달라 미터값만 달라진 경우를
+    # 부재 길이 차이로 읽으면 안 된다(실측: 동바리 세 본 1.99/1.93/1.87m,
+    # 거리 1.705/1.652/1.595m — 비율이 정확히 같다).
+    boxes = [r["point_uv_box"] for r in results if r.get("point_uv_box")]
+    if boxes:
+        B = np.asarray(boxes, float)
+        gx0, gy0 = float(B[:, 0].min()), float(B[:, 1].min())
+        gx1, gy1 = float(B[:, 2].max()), float(B[:, 3].max())
+        mg = 0.01 * max(gx1 - gx0, gy1 - gy0, 1.0)
+        for r in results:
+            bx = r.get("point_uv_box")
+            if not bx:
+                continue
+            r["extent_limited"] = bool(
+                bx[0] <= gx0 + mg or bx[1] <= gy0 + mg
+                or bx[2] >= gx1 - mg or bx[3] >= gy1 - mg)
 
     measured = [r for r in results if r["status"] == "measured"]
     summary = {
@@ -839,7 +906,11 @@ def format_report(result):
                          f"{r['n_points']:>7}   ← {r['reject_reason']}")
             continue
         j = r["judge"] or {}
-        verdict = "합격" if j.get("is_pass") else "기준초과"
+        # judgement 가 있으면 그것이 최종 표기다. is_pass 만 보면
+        # 판정보류(is_pass=None)가 "기준초과" 로 뒤바뀐다 — 판정을 하지
+        # 않은 것과 기준을 넘은 것은 전혀 다른 상태다.
+        verdict = j.get("judgement") or ("합격" if j.get("is_pass")
+                                         else "기준초과")
         f = r["flatness"] or {}
         fmax = (f"{f.get('max_gap_mm', 0.0):.2f}" if f.get("applicable")
                 else "N/A")
