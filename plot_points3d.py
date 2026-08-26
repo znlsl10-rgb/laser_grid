@@ -116,15 +116,35 @@ def _korean_font():
     return False
 
 
-def set_axes_equal(ax):
-    """3축 실제 배율을 맞춘다 — 안 맞추면 형상이 눌리거나 늘어난다."""
+def set_axes_equal(ax, max_ratio=12.0):
+    """
+    3축 실제 배율을 맞춘다 — 안 맞추면 형상이 눌리거나 늘어난다.
+
+    흔한 방법은 세 축을 **가장 큰 범위** 로 똑같이 늘리는 것인데, 그러면
+    깊이가 0.5~4.0m 로 넓은 장면에서 벽이 큰 정육면체 한구석에 몰려
+    깨알만 하게 그려진다. 대신 축 범위는 데이터 그대로 두고 **그리는
+    상자의 비율** 을 데이터 범위에 맞춘다. 1m 가 어느 축에서나 같은
+    길이로 그려지므로 등척은 그대로이고, 화면은 다 쓴다.
+
+    한 축이 거의 납작하면(면 부재의 두께) 상자가 종잇장이 되므로 비율을
+    max_ratio 로 묶는다.
+    """
     lim = np.array([ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()])
+    r = np.maximum(lim[:, 1] - lim[:, 0], 1e-9)
+    floor = float(r.max()) / float(max_ratio)
+    grow = np.maximum(floor - r, 0.0) / 2.0          # 얇은 축만 넓힌다
     c = lim.mean(axis=1)
-    r = 0.5 * float(np.max(lim[:, 1] - lim[:, 0]))
-    r = max(r, 1e-6)
-    ax.set_xlim3d([c[0] - r, c[0] + r])
-    ax.set_ylim3d([c[1] - r, c[1] + r])
-    ax.set_zlim3d([c[2] - r, c[2] + r])
+    r = np.maximum(r, floor)
+    for k, setter in enumerate((ax.set_xlim3d, ax.set_ylim3d, ax.set_zlim3d)):
+        if grow[k] > 0:
+            setter([c[k] - r[k] / 2.0, c[k] + r[k] / 2.0])
+    ax.set_box_aspect(tuple(r / r.max()))
+    # 눌린 축에 눈금을 6개씩 그대로 두면 라벨이 서로 겹쳐 읽을 수 없다.
+    # 상자에서 차지하는 비율만큼만 눈금을 둔다.
+    from matplotlib.ticker import MaxNLocator
+    for k, axis in enumerate((ax.xaxis, ax.yaxis, ax.zaxis)):
+        n = int(np.clip(round(6.0 * r[k] / r.max()), 2, 6))
+        axis.set_major_locator(MaxNLocator(nbins=n, prune=None))
 
 
 # ============ 색 ============
@@ -457,9 +477,19 @@ def draw(groups, path=None, title=None, g_hat=None, frame="gravity",
             if len(D):
                 a.scatter(D[:, i], D[:, j], s=90, facecolors="none",
                           edgecolors="crimson", linewidths=1.4)
-                for q in range(len(D)):
+                # 요철이 한 자리에 겹치면 라벨도 겹친다. 가까운 것끼리는
+                # 위아래로 어긋나게 놓는다.
+                order = np.argsort(D[:, i])
+                # "가깝다" 는 절대값이 아니라 그 축 범위 기준이다 — 깊이만
+                # 좁은 측면도에서 8cm 차이도 화면에서는 겹친다.
+                near = 0.04 * max(float(np.ptp(ALL[:, i])), 1e-6)
+                last, step = -1e9, 0
+                for q in order:
+                    step = step + 1 if (D[q, i] - last) < near else 0
+                    last = D[q, i]
                     a.annotate(f"{Dmm[q]:.1f}mm", (D[q, i], D[q, j]),
-                               textcoords="offset points", xytext=(7, 5),
+                               textcoords="offset points",
+                               xytext=(7, 5 + 11 * (step % 3)),
                                fontsize=7, color="crimson")
             a.set_xlabel(labs[i]); a.set_ylabel(labs[j])
             a.set_title(nm if ko else nm_en, fontsize=11)
