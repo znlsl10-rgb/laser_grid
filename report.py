@@ -406,8 +406,12 @@ def save_segmentation(path, result, base_image=None, shape=None,
                 x0, x1 = min(x0, x1), max(x0, x1)
                 y0, y1 = min(y0, y1), max(y0, y1)
                 cxp, cyp = _tf([dd["center_px"]])[0]
-                # 반지름은 덩어리 크기에 맞추되 너무 작아지지 않게 둔다
-                rad = max(np.hypot(x1 - x0, y1 - y0) / 2.0, W / 90.0)
+                # 반지름은 덩어리 크기에 맞추되 위아래로 묶어 둔다.
+                # 위 한계가 없으면 넓게 퍼진 요철에서 원이 화면을 통째로
+                # 덮고 십자 표시가 이미지를 가로질러, 어디가 요철인지
+                # 오히려 안 보인다(실측: 반지름 1100px).
+                rad = float(np.clip(np.hypot(x1 - x0, y1 - y0) / 2.0,
+                                    W / 90.0, W / 12.0))
                 col = DEFECT_COLOR
                 for wdt, off in ((max(3, W // 500), 0), (max(2, W // 800), 6)):
                     d.ellipse([cxp - rad - off, cyp - rad - off,

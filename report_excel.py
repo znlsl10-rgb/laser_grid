@@ -23,6 +23,8 @@ report_excel.py — 검측 결과를 엑셀 조서로
 """
 import numpy as np
 import importlib.util as _ilu, os as _os
+import tempfile as _tempfile
+import atexit as _atexit
 
 
 def _load(name):
@@ -101,6 +103,71 @@ def _verdict_fill(openpyxl, value):
 # =====================================================================
 # 시트별 작성
 # =====================================================================
+# 그림을 줄여 담아 둔 임시 파일. openpyxl 이 wb.save() 시점에 읽으므로
+# 그때까지 살아 있어야 하고, 프로세스가 끝나면 지운다.
+_EMBED_TMP = []
+
+
+@_atexit.register
+def _cleanup_embed_tmp():
+    for _f in _EMBED_TMP:
+        try:
+            _os.unlink(_f)
+        except OSError:
+            pass
+
+
+def _embed_image(ws, path, row, max_px=1400, col="A", caption=None,
+                 openpyxl=None):
+    """
+    그림을 시트에 붙인다.
+
+    원본을 그대로 넣지 않고 **줄여서** 넣는다. 2448×2048 세그멘테이션
+    이미지는 3.7MB 라, 시트 셋에 원본을 넣으면 조서 하나가 7.5MB 가 된다.
+    엑셀은 파일에 담긴 화소를 통째로 안고 가며 표시 크기만 줄여도 용량은
+    그대로다. 현장에서 열어 보는 조서로는 무겁다.
+
+    max_px 는 긴 변 기준이다. 1400px 이면 화면에서 확대해도 격자점이
+    구분되고, 용량은 원본의 1/5~1/10 이 된다.
+    """
+    if not path or not _os.path.exists(path):
+        ws.cell(row=row, column=1,
+                value=f"[그림 없음] {path or '경로 미지정'}")
+        return row + 1
+    try:
+        from openpyxl.drawing.image import Image as XLImage
+        from PIL import Image as PILImage
+    except ImportError:
+        ws.cell(row=row, column=1, value="[그림 생략] Pillow/openpyxl 필요")
+        return row + 1
+    try:
+        if caption:
+            c = ws.cell(row=row, column=1, value=caption)
+            if openpyxl is not None:
+                c.font = openpyxl.styles.Font(bold=True, size=11)
+            row += 1
+        with PILImage.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            sc = min(1.0, float(max_px) / max(w, h))
+            if sc < 1.0:
+                im = im.resize((max(1, int(w * sc)), max(1, int(h * sc))),
+                               PILImage.LANCZOS)
+            tmp = _tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            tmp.close()
+            im.save(tmp.name, format="PNG", optimize=True)
+            _EMBED_TMP.append(tmp.name)
+            iw, ih = im.size
+        xi = XLImage(tmp.name)
+        xi.width, xi.height = iw, ih
+        ws.add_image(xi, f"{col}{row}")
+        # 그림이 덮는 만큼 행을 비워 둔다 (기본 행 높이 20px 가정)
+        return row + int(ih / 19.0) + 3
+    except Exception as e:
+        ws.cell(row=row, column=1, value=f"[그림 삽입 실패] {e}")
+        return row + 1
+
+
 def _sheet_summary(wb, openpyxl, record, meta, result):
     ws = wb.active
     ws.title = "1.요약"
@@ -196,7 +263,8 @@ def _sheet_design(wb, openpyxl):
     return ws
 
 
-def _sheet_detection(wb, openpyxl, det, e2e=None, tri=None):
+def _sheet_detection(wb, openpyxl, det, e2e=None, tri=None,
+                     overlay_image=None):
     """
     선검출 정확도 — 화소가 맞아야 3D 가 맞는다.
 
@@ -204,7 +272,7 @@ def _sheet_detection(wb, openpyxl, det, e2e=None, tri=None):
     1px 흔들리면 깊이가 Z²/(f·b) 만큼 흔들린다. 뒤쪽 검측식이 아무리
     정확해도 여기서 끝난다. 그래서 조서에 넣는다.
     """
-    ws = wb.create_sheet("3.선검출정확도")
+    ws = wb.create_sheet("3.선검출(1단계)")
     from openpyxl.styles import PatternFill, Font
     if not det:
         ws.append(["선검출 정확도", "평가하지 않음"])
@@ -376,13 +444,72 @@ def _sheet_detection(wb, openpyxl, det, e2e=None, tri=None):
     _style(ws, openpyxl,
            widths=[6, 6, 9, 13, 11, 10, 10, 10, 9, 10, 10, 40],
            header_row=hdr)
+    _embed_image(ws, overlay_image, ws.max_row + 3, max_px=1600,
+                 openpyxl=openpyxl,
+                 caption="[그림] 선검출 대조 — 배경은 레이캐스트 렌더, "
+                         "자홍색이 검출한 선, 청록색이 정답 화소")
+    return ws
+
+
+def _sheet_depth(wb, openpyxl, depth, det=None, source=None):
+    """
+    깊이 검증 — 검출 화소로 푼 3D 가 참값과 몇 mm 다른가.
+
+    화소 오차(px)와 각도 오차(°)만으로는 정작 궁금한 것이 빠진다.
+    평활도는 점별 깊이 오차가 그대로 결과이므로, 이 표가 곧 평활도를
+    믿을 수 있는지의 근거다.
+    """
+    ws = wb.create_sheet("4.깊이검증(2단계)")
+    ws.append(["항목", "값", "설명"])
+    src_ko = {"detected": "검출 화소 (이미지에서 찾은 것 — 실장비와 같음)",
+              "gt": "정답 화소 (raycast — 카메라가 완벽했다면의 상한)"}
+    ws.append(["검측에 넣은 화소", src_ko.get(source, source or "-"),
+               "이 조서의 모든 3D·각도·평활도 값이 여기서 나왔다"])
+    if not depth:
+        ws.append(["깊이 검증", "수행 못함",
+                   "raycast 참값(xyz_world)이 있는 입력에서만 잴 수 있다"])
+        _style(ws, openpyxl, widths=[24, 30, 78])
+        return ws
+    mm = (det or {}).get("mm_per_px_depth")
+    rows = [
+        ("비교 대상 점", f"{depth['n_points']:,}점",
+         "검출점과 정답점은 같은 점이 아니다. 같은 선에서 스캔축 좌표가 "
+         "같은 자리의 참값을 선형보간해 꺼내 비교했다"),
+        ("", "", ""),
+        ("깊이 치우침 (중앙값)", f"{depth['z_bias_mm']:+.2f} mm",
+         "모든 점이 한쪽으로 밀린 몫. 좌표 규약·주점·기선이 어긋나면 "
+         "생기며 소프트웨어로 없앨 수 있다"),
+        ("깊이 산포 (σ)", f"{depth['z_noise_mm']:.2f} mm",
+         "치우침을 뺀 나머지. 이것이 실제 점별 깊이 정밀도이고, "
+         "평활도(±2mm 목표)가 잴 수 있는지를 여기서 가른다"
+         + (f". 화소 1px = 깊이 {mm} mm" if mm else "")),
+        ("깊이 RMS", f"{depth['z_rms_mm']:.2f} mm", "치우침 + 산포"),
+        ("깊이 95 백분위", f"{depth['z_p95_mm']:.2f} mm",
+         "스무 점 중 한 점은 이보다 더 틀린다"),
+        ("", "", ""),
+        ("3D 위치 오차 (중앙)", f"{depth['dist_med_mm']:.2f} mm",
+         "깊이만이 아니라 X·Y 까지 포함한 점 사이 거리"),
+        ("3D 위치 오차 (95%)", f"{depth['dist_p95_mm']:.2f} mm", ""),
+    ]
+    for a, b, c in rows:
+        ws.append([a, b, c])
+    _style(ws, openpyxl, widths=[24, 30, 78])
+
+    pl = depth.get("per_line_mm") or {}
+    if pl:
+        ws.append([])
+        h = ws.max_row + 1
+        ws.append(["선", "깊이 오차 중앙값(mm)", ""])
+        for lid in sorted(pl, key=lambda k: (k[0], int(k[1:]))):
+            ws.append([lid, pl[lid], ""])
+        _style(ws, openpyxl, widths=[24, 30, 78], header_row=h)
     return ws
 
 
 def _sheet_segmentation(wb, openpyxl, result, record, label_pixels=None,
                         seg_image_path=None):
     """색깔별로 무엇을 무엇으로 구분했는지."""
-    ws = wb.create_sheet("4.세그멘테이션")
+    ws = wb.create_sheet("5.세그멘테이션(3단계)")
     ws.append(["색", "클래스(코드)", "부재", "영역 수", "격자점 수",
                "화소 수", "검측 항목", "적용 기준(KCS)"])
     from openpyxl.styles import PatternFill
@@ -420,24 +547,16 @@ def _sheet_segmentation(wb, openpyxl, result, record, label_pixels=None,
 
     # 세그멘테이션 이미지를 시트에 붙인다. 색 범례와 그림이 떨어져 있으면
     # 어느 색이 무엇인지 대조하느라 시트를 오가야 한다.
-    if seg_image_path and _os.path.exists(seg_image_path):
-        try:
-            from openpyxl.drawing.image import Image as XLImage
-            from PIL import Image as PILImage
-            with PILImage.open(seg_image_path) as im:
-                w, h = im.size
-            scale = min(1.0, 900.0 / max(w, 1))
-            xi = XLImage(seg_image_path)
-            xi.width, xi.height = int(w * scale), int(h * scale)
-            ws.add_image(xi, f"A{ws.max_row + 3}")
-        except Exception:
-            pass
+    _embed_image(ws, seg_image_path, ws.max_row + 3, max_px=1500,
+                 openpyxl=openpyxl,
+                 caption="[그림] 세그멘테이션 결과 — 원본 사진 위에 부재별 "
+                         "색으로 찍은 격자점, 자홍색 원이 요철 위치")
     return ws
 
 
 def _sheet_results(wb, openpyxl, record):
     """구분별 품질검측 결과 — 이 조서의 본문."""
-    ws = wb.create_sheet("5.검측결과")
+    ws = wb.create_sheet("6.검측결과")
     ws.append(["No", "부재", "검측 항목", "측정 각도(°)", "허용",
                "편차(mm)", "자세 판정",
                "직선자(m)", "처짐(mm)", "처짐 상한(mm)", "허용(mm)",
@@ -479,7 +598,7 @@ def _sheet_results(wb, openpyxl, record):
 
 def _sheet_flatness(wb, openpyxl, result):
     """KCS 직선자 길이별 상세. 3m 와 1m 는 허용치가 다르다."""
-    ws = wb.create_sheet("6.평활도상세")
+    ws = wb.create_sheet("7.평활도상세")
     ws.append(["No", "부재", "직선자 길이(m)", "실제 측정 구간(m)",
                "처짐(mm)", "처짐 상한(mm)", "허용(mm)", "허용 대비",
                "판정", "비고"])
@@ -511,7 +630,7 @@ def _sheet_flatness(wb, openpyxl, result):
 
 def _sheet_defects(wb, openpyxl, result, seg_image_path=None):
     """검출된 요철이 화면 어디에 있는가."""
-    ws = wb.create_sheet("7.요철위치")
+    ws = wb.create_sheet("8.요철위치")
     ws.append(["No", "부재", "요철", "깊이(mm)", "크기(mm)",
                "화면 중심 u,v (px)", "화면 범위 u1,v1–u2,v2 (px)",
                "측정거리(m)", "구성 점수"])
@@ -534,23 +653,14 @@ def _sheet_defects(wb, openpyxl, result, seg_image_path=None):
                "이미지에 자홍색 원으로 같은 위치가 표시된다. 깊이는 평활값이 "
                "아니라 그 자리의 원시 잔차에서 잰 값이다 — 평활 창이 요철보다 "
                "넓으면 깊이를 깎기 때문이다."])
-    if seg_image_path and _os.path.exists(seg_image_path):
-        try:
-            from openpyxl.drawing.image import Image as XLImage
-            from PIL import Image as PILImage
-            with PILImage.open(seg_image_path) as im:
-                w, h = im.size
-            sc = min(1.0, 900.0 / max(w, 1))
-            xi = XLImage(seg_image_path)
-            xi.width, xi.height = int(w * sc), int(h * sc)
-            ws.add_image(xi, f"A{ws.max_row + 3}")
-        except Exception:
-            pass
+    _embed_image(ws, seg_image_path, ws.max_row + 3, max_px=1500,
+                 openpyxl=openpyxl,
+                 caption="[그림] 요철 위치 — 자홍색 원과 깊이 표기")
     return ws
 
 
 def _sheet_caveats(wb, openpyxl, record, extra=None):
-    ws = wb.create_sheet("8.유의사항")
+    ws = wb.create_sheet("11.유의사항")
     ws.append(["구분", "내용"])
     for c in record.get("caveats", []):
         ws.append(["측정", c])
@@ -611,15 +721,9 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
         ws.cell(row=n + 1 + i, column=1, value=t)
         ws.merge_cells(start_row=n + 1 + i, start_column=1,
                        end_row=n + 1 + i, end_column=14)
-    if image_path and _os.path.exists(image_path):
-        try:
-            from openpyxl.drawing.image import Image as XLImage
-            img = XLImage(image_path)
-            sc = min(1.0, 1100.0 / float(img.width))
-            img.width = int(img.width * sc); img.height = int(img.height * sc)
-            ws.add_image(img, f"A{n + 6}")
-        except Exception:
-            pass
+    _embed_image(ws, image_path, n + 6, max_px=1700, openpyxl=openpyxl,
+                 caption="[그림] 부재별 3D 점군 — 등각·평면도·정면도·측면도. "
+                         "중력 정렬 좌표라 벽은 서고 바닥은 눕는다")
     return ws
 
 
@@ -662,7 +766,8 @@ def _sheet_pointcloud_xyz(wb, openpyxl, result, g_hat=None, stride=20,
 def save_excel(path, result, meta=None, label_pixels=None,
                extra_caveats=None, seg_image_path=None, detection=None,
                end_to_end=None, triangulation=None, g_hat=None,
-               pointcloud_image=None, pc_stride=20):
+               pointcloud_image=None, pc_stride=20, detection_image=None,
+               depth_check=None, pixel_source=None):
     """
     검측 결과를 엑셀 조서로 저장한다.
 
@@ -675,7 +780,10 @@ def save_excel(path, result, meta=None, label_pixels=None,
     detection    : load_capture.evaluate_line_detection 결과 (선택)
     g_hat        : (3,) 조사기 좌표계 중력. 주면 3D 좌표 시트가 중력 정렬
                    좌표(가로·깊이·높이)를 함께 낸다
-    pointcloud_image : 3D 점군 이미지 경로 — 9번 시트에 삽입
+    pointcloud_image : 3D 점군 이미지 경로 — 3D 좌표 시트에 삽입
+    detection_image : 선검출 대조 이미지 경로 — 선검출정확도 시트에 삽입
+    depth_check  : load_capture.verify_depth 결과 — 깊이검증 시트
+    pixel_source : "detected" | "gt" — 검측에 넣은 화소가 무엇이었는지
     pc_stride    : 3D 점목록 시트에 N개마다 한 점 (기본 20)
     """
     import openpyxl
@@ -683,16 +791,26 @@ def save_excel(path, result, meta=None, label_pixels=None,
     wb = openpyxl.Workbook()
     _sheet_summary(wb, openpyxl, record, dict(meta or {}), result)
     _sheet_design(wb, openpyxl)
-    _sheet_detection(wb, openpyxl, detection, end_to_end, triangulation)
+    _sheet_detection(wb, openpyxl, detection, end_to_end, triangulation,
+                     overlay_image=detection_image)
+    _sheet_depth(wb, openpyxl, depth_check, detection, pixel_source)
     _sheet_segmentation(wb, openpyxl, result, record, label_pixels,
                         seg_image_path)
+    _sheet_pointcloud(wb, openpyxl, result, g_hat=g_hat,
+                      image_path=pointcloud_image)
     _sheet_results(wb, openpyxl, record)
     _sheet_flatness(wb, openpyxl, result)
     _sheet_defects(wb, openpyxl, result, seg_image_path)
-    _sheet_caveats(wb, openpyxl, record, extra_caveats)
-    _sheet_pointcloud(wb, openpyxl, result, g_hat=g_hat,
-                      image_path=pointcloud_image)
     _sheet_pointcloud_xyz(wb, openpyxl, result, g_hat=g_hat, stride=pc_stride)
+    _sheet_caveats(wb, openpyxl, record, extra_caveats)
+    # 탭 순서를 파이프라인 순서로 맞춘다 — 선검출 → 깊이 → 분할/3D → 검측
+    order = ["1.요약", "2.설계값", "3.선검출(1단계)", "4.깊이검증(2단계)",
+             "5.세그멘테이션(3단계)", "6.검측결과", "7.평활도상세",
+             "8.요철위치", "9.3D좌표(부재별)", "10.3D좌표(점목록)",
+             "11.유의사항"]
+    have = [t for t in order if t in wb.sheetnames]
+    wb._sheets = ([wb[t] for t in have]
+                  + [w for w in wb.worksheets if w.title not in have])
     d = _os.path.dirname(_os.path.abspath(path))
     if d:
         _os.makedirs(d, exist_ok=True)

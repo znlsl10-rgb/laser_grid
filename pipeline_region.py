@@ -319,7 +319,11 @@ def split_incoherent_region(xyz, cls, g_hat, min_points=12,
         if n_out < min_points or n_out / n < outlier_frac:
             return keep_all
 
-    # 섞였다 → 기하 전용 백엔드로 이 영역만 다시 나눈다
+    # 섞였다 → 기하 전용 백엔드로 이 영역만 다시 나눈다.
+    # 문턱은 위에서 쓴 것과 **같은 값** 을 넘긴다. 여기만 기본값(10mm)으로
+    # 두면, 잡음이 그보다 큰 촬영에서 이미 한 면으로 잘 잡힌 영역을 다시
+    # 여러 조각으로 갈라 놓는다(실측: 2.7m 벽 σ_Z=15.9mm 에서 벽 하나가
+    # 셋으로 쪼개져 조각마다 수직도 0.0000° 로 나왔다).
     try:
         seg = _SEG.segment(None, backend="geom",
                            table={"xyz": pts,
@@ -327,7 +331,8 @@ def split_incoherent_region(xyz, cls, g_hat, min_points=12,
                                   "lid": np.array(["R"] * n, dtype=object),
                                   "seq": np.arange(n)},
                            g_hat=g_hat, min_plane_points=min_points,
-                           min_linear_points=min_points)
+                           min_linear_points=min_points,
+                           plane_threshold_m=plane_threshold_m)
     except Exception:
         return keep_all
 
@@ -378,6 +383,26 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
     """
     seg_kwargs = dict(seg_kwargs or {})
     table = _EQ5.build_point_table(lines_pixels, lines_xyz)
+
+    # ── 평면 판정 문턱을 **이 촬영의 실제 깊이 잡음** 에 맞춘다 ──
+    # 고정값(10~15mm)을 쓰면 잡음이 그보다 큰 장면에서 한 면이 여러 평면으로
+    # 쪼개진다. 실측: 2.7m 거리의 벽은 σ_Z=15.9mm 인데, 10mm 문턱에서는
+    # 벽 하나가 세 조각(6217·6984·2532점)으로 갈리고 조각마다 수직도가
+    # 0.0000° 로 나와 판정이 무의미해졌다.
+    #
+    #   σ_Z = σ_u · Z² / (f·b)      문턱 = 3σ_Z
+    #
+    # 3σ 는 정규분포에서 성한 점의 99.7% 를 담는 폭이다. 잡음보다 좁게
+    # 잡으면 같은 면을 쪼개고, 너무 넓게 잡으면 다른 면을 삼킨다.
+    noise_threshold_m = 0.015
+    if len(table["xyz"]):
+        _f = float(camera_params.get("f_px", 2318.8))
+        _b = float(camera_params.get("b_m", 0.150))
+        _z = float(np.median(table["xyz"][:, 2]))
+        noise_threshold_m = float(np.clip(
+            3.0 * float(sigma_u_px) * _z * _z / (_f * _b), 0.008, 0.10))
+    split_threshold_m = noise_threshold_m
+
     if len(table["xyz"]) == 0:
         return {"regions": [], "summary": {"n_regions": 0},
                 "error": "삼각측량된 격자점이 없습니다."}
@@ -387,6 +412,17 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
         seg_kwargs.setdefault("table", table)
         seg_kwargs.setdefault("g_hat", g_hat)
         seg_kwargs.setdefault("camera_params", camera_params)
+        # 평면 RANSAC 의 inlier 문턱을 **이 촬영의 실제 깊이 잡음** 에 맞춘다.
+        #
+        # 고정값 10mm 를 쓰면 잡음이 그보다 큰 장면에서 한 면이 여러 평면으로
+        # 쪼개진다. 실측: 2.7m 거리의 벽은 σ_Z=15.9mm 인데 두께가 170mm 뿐이라,
+        # 10mm 문턱으로는 벽 하나가 세 조각(6217·6984·2532점)으로 갈리고
+        # 조각마다 수직도가 0.0000° 로 나와 판정이 무의미해졌다.
+        #
+        # 문턱은 3σ 로 둔다 — 정규분포에서 성한 점의 99.7% 를 담는 폭이다.
+        # 잡음보다 좁게 잡으면 같은 면을 쪼개고, 너무 넓게 잡으면 다른 면을
+        # 삼킨다. 아래위로 묶어 극단을 막는다.
+        seg_kwargs.setdefault("plane_threshold_m", noise_threshold_m)
     seg = _SEG.segment(rgb_off, backend=seg_backend, **seg_kwargs)
 
     # ── [eq5] 점 → 영역 ──
@@ -417,8 +453,10 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
         # 축 정제가 이를 버려 바닥 검측이 통째로 사라짐).
         parts = ([(fu0["final_class"], np.arange(len(pts_all)))]
                  if not split_incoherent
-                 else split_incoherent_region(pts_all, fu0["final_class"],
-                                              g_hat, min_points=min_region_points))
+                 else split_incoherent_region(
+                     pts_all, fu0["final_class"], g_hat,
+                     min_points=min_region_points,
+                     plane_threshold_m=split_threshold_m))
         if len(parts) > 1:
             n_split += 1
 

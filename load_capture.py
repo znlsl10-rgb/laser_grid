@@ -651,6 +651,22 @@ def _base_image(path, size, flipped=False, cx_img=None, cy_img=None,
         laser = _load("CAST.png")
         return None if laser is None else laser.astype(np.uint8)
     scene = _remove_laser(scene)
+    # ── 남은 초록 기운까지 뺀 뒤 흑백으로 ──
+    # 능선 제거는 폭 몇 화소짜리 선의 심만 지운다. 이 렌더의 레이저는
+    # 그 둘레로 30px 남짓 퍼진 옅은 무리를 달고 있어, 중앙값 창(15px)이
+    # 배경과 구분하지 못하고 그대로 남는다. 실제로 결과 이미지에 초록
+    # 격자가 비쳐 검출점과 뒤섞였다.
+    #
+    # 두 단계로 없앤다.
+    #   1) 남은 초록 과잉분 G − max(R,B) 를 G 에서 뺀다 → 색조가 사라진다
+    #   2) 흑백으로 바꾼다 → 배경에 색이 아예 없어야 부재 색이 읽힌다
+    # 장면의 결·모서리·명암은 그대로 남으므로 "어디를 쟀는지" 는 여전히
+    # 보인다. 배경은 맥락을 주는 역할이지 그 자체가 결과가 아니다.
+    ex = scene[:, :, 1] - np.maximum(scene[:, :, 0], scene[:, :, 2])
+    scene[:, :, 1] -= np.clip(ex, 0.0, None)
+    gray = (0.299 * scene[:, :, 0] + 0.587 * scene[:, :, 1]
+            + 0.114 * scene[:, :, 2])
+    scene = np.repeat(gray[:, :, None], 3, axis=2)
 
     if show_true_laser:
         laser = _load("CAST.png")
@@ -821,6 +837,115 @@ def verify_triangulation(cap, stride=None):
             "z_sigma_mm": round(float(ez.std()), 5)}
 
 
+def detected_lines_sensor(cap, det, families=("V", "H")):
+    """
+    선검출 결과를 **검측이 쓰는 좌표 규약** 으로 옮긴다.
+
+    검출은 화면 캡처 이미지 위에서 이뤄지고, 검측은 센서 화소 기준이다.
+    게다가 이 내보내기는 캡처에 따라 uv 가 180° 돌아 있다. 둘을 맞춰
+    주지 않으면 삼각측량이 통째로 어긋난다.
+
+      1) 화면 → 센서 배율 (가로·세로가 다르므로 따로)
+      2) 필요하면 주점 기준 반전 (2c − u, 2c − v)
+
+    이미지를 돌리지 않고 좌표만 되돌리는 이유는, 주점이 이미지 중심과
+    다르면 회전 리샘플링이 화소 격자에 딱 떨어지지 않아 그만큼 계통
+    오차가 남기 때문이다(실측 −0.96px = 깊이 18.5mm).
+    """
+    if not det or det.get("error"):
+        return {}
+    cp = cap["camera_params"]
+    su, sv = det["scale_to_sensor"], det["scale_to_sensor_v"]
+    flip = bool(cap["diag"]["uv 180° 뒤집힘"])
+    cx, cy = cp["cx_px"], cp["cy_px"]
+    out = {}
+    for lid, d in (det.get("_detected") or {}).items():
+        if lid[0] not in families:
+            continue
+        d = np.asarray(d, float)
+        if len(d) < 5:
+            continue
+        uv = d * np.array([su, sv])
+        if flip:
+            uv = np.stack([2 * cx - uv[:, 0], 2 * cy - uv[:, 1]], axis=1)
+        out[lid] = uv
+    return out
+
+
+def verify_depth(lines_uv, lines_xyz, cap):
+    """
+    삼각측량으로 나온 깊이를 raycast 참값과 직접 맞대 본다.
+
+    왜 따로 재는가
+    -------------
+    화소 오차(px)와 각도 오차(°)만 보면 정작 궁금한 것이 빠진다 —
+    **이 점의 거리가 몇 mm 틀렸나** 이다. 검측식(평면·축 적합)은 수만
+    점을 평균하므로 각도는 좋게 나오지만, 평활도는 점별 깊이 오차가
+    그대로 결과다. 그래서 점별 깊이를 따로 잰다.
+
+    비교 방법
+    --------
+    검출점과 정답점은 같은 점이 아니다(선 위 표본 위치가 다르다). 같은
+    선에서 스캔축 좌표가 같은 자리의 참값을 선형보간해 꺼내 비교한다.
+    V선은 v 를 따라, H선은 u 를 따라 맞춘다.
+
+    참값 3D 는 내보내기의 xyz_world 를 조사기 좌표계로 옮겨 쓴다.
+        P_laser = (P_world − L) @ R
+    """
+    rt = cap["raw"].get("rig_transform") or {}
+    if "laser_pos_world" not in rt:
+        return None
+    L = np.array(rt["laser_pos_world"], float)
+    R = cap["R_cam"]
+    cx = cap["camera_params"]["cx_px"]
+    cy = cap["camera_params"]["cy_px"]
+    flip = bool(cap["diag"]["uv 180° 뒤집힘"])
+    su = cap["raw"]["sensor_size"][0] / float(
+        cap["raw"].get("screenshot_size", cap["raw"]["sensor_size"])[0])
+    sv = cap["raw"]["sensor_size"][1] / float(
+        cap["raw"].get("screenshot_size", cap["raw"]["sensor_size"])[1])
+
+    dz, dxyz, per_line = [], [], {}
+    for lid, uv in lines_uv.items():
+        ln = cap["cast"].get(lid)
+        if ln is None or lid not in lines_xyz:
+            continue
+        g_uv = np.array([[p["uv"][0] * su, p["uv"][1] * sv]
+                         for p in ln["points"]], float)
+        if flip:
+            g_uv = np.stack([2 * cx - g_uv[:, 0], 2 * cy - g_uv[:, 1]], axis=1)
+        g_xyz = (np.array([p["xyz_world"] for p in ln["points"]], float)
+                 - L) @ R
+        ax = 1 if ln["fixed"] == "alpha" else 0     # V선은 v, H선은 u 로 맞춘다
+        o = np.argsort(g_uv[:, ax])
+        s_gt = g_uv[o, ax]
+        uv = np.asarray(uv, float)
+        got = np.asarray(lines_xyz[lid], float)
+        n = min(len(uv), len(got))
+        uv, got = uv[:n], got[:n]
+        inr = (uv[:, ax] >= s_gt[0]) & (uv[:, ax] <= s_gt[-1])
+        if inr.sum() < 5:
+            continue
+        ref = np.column_stack([np.interp(uv[inr, ax], s_gt, g_xyz[o, k])
+                               for k in range(3)])
+        e = got[inr] - ref
+        dz.append(e[:, 2])
+        dxyz.append(np.linalg.norm(e, axis=1))
+        per_line[lid] = round(float(np.median(np.abs(e[:, 2]))) * 1000.0, 3)
+    if not dz:
+        return None
+    Z = np.concatenate(dz) * 1000.0
+    D = np.concatenate(dxyz) * 1000.0
+    return {"n_points": int(len(Z)),
+            "z_bias_mm": round(float(np.median(Z)), 3),
+            "z_noise_mm": round(float(np.std(Z - np.median(Z))), 3),
+            "z_rms_mm": round(float(np.sqrt(np.mean(Z ** 2))), 3),
+            "z_p95_mm": round(float(np.percentile(np.abs(Z), 95)), 3),
+            "dist_med_mm": round(float(np.median(D)), 3),
+            "dist_p95_mm": round(float(np.percentile(D, 95)), 3),
+            "per_line_mm": per_line}
+
+
 def evaluate_end_to_end(path, cap, det, backend="geom", sigma_u_px=None):
     """
     검출 화소로 검측까지 돌려 정답 화소 결과와 맞대 본다.
@@ -837,19 +962,7 @@ def evaluate_end_to_end(path, cap, det, backend="geom", sigma_u_px=None):
     flip = bool(cap["diag"]["uv 180° 뒤집힘"])
     cx, cy = cp["cx_px"], cp["cy_px"]
 
-    # 검출 화소를 검측 규약(센서 스케일, 필요하면 반전)으로 옮긴다
-    lines_det = {}
-    for lid, ln in cap["cast"].items():
-        if ln["fixed"] != "alpha":
-            continue
-        d = det.get("_detected", {}).get(lid)
-        if d is None or len(d) < 5:
-            continue
-        uv = np.asarray(d, float) * np.array([su, det["scale_to_sensor_v"]])
-        if flip:
-            uv = np.stack([2 * cx - uv[:, 0], 2 * cy - uv[:, 1]], axis=1)
-        lines_det[lid] = uv
-
+    lines_det = detected_lines_sensor(cap, det)
     if not lines_det:
         return None
     su_px = CALIB.SIGMA_U_PX if sigma_u_px is None else float(sigma_u_px)
@@ -897,7 +1010,23 @@ def evaluate_end_to_end(path, cap, det, backend="geom", sigma_u_px=None):
 # 검측 실행
 # =====================================================================
 def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
-                   sigma_u_px=None, eval_detection=True, pc_stride=20):
+                   sigma_u_px=None, eval_detection=True, pc_stride=20,
+                   source="detected"):
+    """
+    내보내기 폴더 하나를 검측한다.
+
+    흐름 — 실장비가 하는 일과 같은 순서다.
+      [1] 선검출    CAST.png(레이캐스트 렌더) → 화소 (u,v)
+      [2] 3D 복원   화소 → eq7 삼각측량 → (X,Y,Z) 조사기 좌표
+                    raycast 참값과 깊이를 직접 대조한다
+      [3] 검측      영역분할 → 부재별 수직도·수평도·평활도
+      [4] 산출      3D 점군 그림 · 세그멘테이션 · 엑셀 조서
+
+    source : "detected" | "gt"
+        검측에 넣을 화소. 기본은 검출 화소다 — 실장비에는 정답 화소가
+        없으므로 그래야 현장에서 나올 값이 조서에 실린다. "gt" 는
+        "카메라가 완벽했다면" 의 상한을 보고 싶을 때만 쓴다.
+    """
     name = os.path.basename(os.path.normpath(path))
     cap = load_folder(path, stride=stride)
     cp = cap["camera_params"]
@@ -917,35 +1046,13 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
         print(f"  {'삼각측량 자체 검증':<24}정답 화소 → 3D 오차 중앙 "
               f"{tri['dist_med_mm']:.4f}mm (최대 {tri['dist_max_mm']:.3f}mm)")
 
-    lines_xyz, lines_uv, tri_info = PIPE.triangulate_lines(
-        cap["lines_pixels"], cap["line_angles"], cp)
-    n3d = sum(len(v) for v in lines_xyz.values())
-    nf = tri_info["n_by_family"]
-    print(f"  {'삼각측량 성공 점':<24}{n3d}"
-          f"   (V {nf.get('V', 0)} + H {nf.get('H', 0)})")
-    for fam, d in tri_info["family"].items():
-        gm = d["이득_중앙"]
-        print(f"  {'  ' + d['이름']:<24}"
-              f"{d['선 수']}개 중 깊이가능 {d['깊이가능']}개"
-              + (f"   이득 g 중앙 {gm}" if gm is not None else "")
-              + (f"   g=∞ {d['무한대']}개" if d["무한대"] else ""))
-    if n3d == 0:
-        print("  [중단] 삼각측량된 점이 없다.")
-        return None
-
-    # 라캐스트 참값과 대조 — 이 내보내기에는 xyz_world 가 있으므로
-    # 검측 이전 단계(해상도·자세·기선)가 맞았는지 여기서 확인할 수 있다.
-    zt = _truth_depth(cap, lines_xyz)
-    if zt is not None:
-        print(f"  {'깊이 복원오차(중앙값)':<24}{zt*1000:.3f} mm  ← raycast 참값 대조")
-
     out_dir = out_dir or os.path.join(path, "_검측결과")
     os.makedirs(out_dir, exist_ok=True)
 
-    # ── 선검출 정확도 ──
-    # 검측 파이프라인은 정답 화소를 그대로 썼다. 실장비는 이미지에서
-    # 화소를 찾아내야 하므로, 그 단계가 얼마나 정확한지 따로 잰다.
-    # 화소 1px 이 깊이 몇 mm 인지까지 환산해 조서에 남긴다.
+    # ── [1단계] 선검출 — 렌더 이미지에서 화소를 찾는다 ──
+    # 실장비에는 정답 화소가 없다. 이미지에서 선을 찾아내는 것이 첫 단계이고,
+    # 그 결과가 뒤의 3D·검측을 전부 결정한다. 정답 화소는 여기서 "얼마나
+    # 잘 찾았나" 를 재는 자로만 쓴다.
     det_eval = None
     if eval_detection:
         try:
@@ -987,10 +1094,62 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
             print(f"    → 불확실도 σ_u 에 실측 {su:.3f}px 사용 "
                   f"(설계 가정 {CALIB.SIGMA_U_PX}px)")
 
+    # ── [2단계] 검출 화소 → 3D 좌표(깊이) ──
+    # source="detected" 가 기본이다. 실장비가 실제로 하는 일이 이것이고,
+    # 조서에 실리는 값도 그래야 현장에서 나올 값이 된다. 정답 화소로
+    # 돌린 결과는 "카메라가 완벽했다면" 의 상한이라, 비교용으로만 쓴다.
+    src = (source or "detected").lower()
+    lines_in = None
+    if src == "detected":
+        lines_in = detected_lines_sensor(cap, det_eval)
+        if not lines_in:
+            print("  [경고] 검출 화소를 얻지 못해 정답 화소로 되돌린다.")
+            src = "gt"
+    if src != "detected":
+        lines_in = cap["lines_pixels"]
+
+    lines_xyz, lines_uv, tri_info = PIPE.triangulate_lines(
+        lines_in, cap["line_angles"], cp)
+    n3d = sum(len(v) for v in lines_xyz.values())
+    nf = tri_info["n_by_family"]
+    src_ko = "검출 화소" if src == "detected" else "정답 화소"
+    print(f"\n  [2단계] 3D 복원 — 입력: {src_ko}")
+    print(f"    {'삼각측량 성공 점':<22}{n3d}"
+          f"   (V {nf.get('V', 0)} + H {nf.get('H', 0)})")
+    for fam, d in tri_info["family"].items():
+        gm = d["이득_중앙"]
+        print(f"    {'  ' + d['이름']:<22}"
+              f"{d['선 수']}개 중 깊이가능 {d['깊이가능']}개"
+              + (f"   이득 g 중앙 {gm}" if gm is not None else "")
+              + (f"   g=∞ {d['무한대']}개" if d["무한대"] else ""))
+    if n3d == 0:
+        print("  [중단] 삼각측량된 점이 없다.")
+        return None
+
+    # 이 3D 가 맞는지 raycast 참값과 **직접** 맞댄다. 화소 오차나 각도
+    # 오차가 아니라, 점의 거리가 몇 mm 틀렸는지가 여기서 나온다.
+    depth = None
+    try:
+        depth = verify_depth(lines_uv, lines_xyz, cap)
+    except Exception as e:
+        print(f"    [경고] 깊이 검증 실패: {e}")
+    if depth:
+        print(f"    {'깊이 오차 (vs raycast)':<22}"
+              f"치우침 {depth['z_bias_mm']:+.2f} mm / "
+              f"산포 {depth['z_noise_mm']:.2f} mm / "
+              f"RMS {depth['z_rms_mm']:.2f} mm  ({depth['n_points']:,}점)")
+        print(f"    {'3D 위치 오차':<22}"
+              f"중앙 {depth['dist_med_mm']:.2f} mm / "
+              f"95% {depth['dist_p95_mm']:.2f} mm")
+
+    # ── [3단계] 영역분할 + 부재별 검측 ──
+    print(f"\n  [3단계] 영역분할 → 수직도·수평도·평활도")
     res = PIPE.inspect_image(lines_uv, lines_xyz, cp, cap["g_hat"],
                              seg_backend=backend, sigma_u_px=su,
                              line_gain=tri_info["line_gain"])
     res["triangulation"] = tri_info
+    res["pixel_source"] = src
+    res["depth_check"] = depth
     print()
     print(PIPE.format_report(res))
 
@@ -1026,11 +1185,13 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
     meta.update({k: str(v) for k, v in cap["diag"].items()})
     meta["불확실도 σ_u (px)"] = f"{su:.3f}  ({su_src})"
     caveats = [
-        "실촬영이 아니라 Isaac raycast 내보내기다. 선검출(A_선검출) 단계를 "
-        "거치지 않았으므로 검출 오차는 0 이고, 검측식·영역분할만 검증된다.",
-        f"불확실도(σ_n)는 선검출 오차 σ_u={su}px 를 가정해 계산한 값이다. "
-        f"이 내보내기의 uv 는 해석적 raycast 값이라 실제 검출 오차가 0 이므로, "
-        f"표에 적힌 σ_n 은 측정치가 아니라 설계 가정에 따른 예상치다.",
+        ("실촬영이 아니라 Isaac raycast 내보내기다. 다만 검측에 넣은 화소는 "
+         "정답이 아니라 **렌더 이미지에서 선검출로 찾은 것**이므로, 화소→3D→"
+         "검측의 전 구간이 실장비와 같은 경로를 지난다."
+         if src == "detected" else
+         "검측에 정답 화소(raycast)를 그대로 넣었다. 선검출 단계를 건너뛴 "
+         "값이라 '카메라가 완벽했다면' 의 상한이며, 현장 실측값이 아니다."),
+        f"불확실도(σ_n)는 선검출 오차 σ_u={su:.3f}px({su_src})로 계산했다.",
         "카메라 자세는 헤더가 아니라 (xyz_world, uv) 대응에서 Kabsch 로 "
         "복원했다. 헤더에는 롤이 없어 아래를 보는 촬영에서 자세를 세울 수 "
         "없고, 캡처마다 uv 축 방향도 다르다.",
@@ -1073,11 +1234,18 @@ def inspect_folder(path, out_dir=None, backend="geom", stride=1, site=None,
                 f"영향이 없으나, 평활도 자처짐은 최대 {e2e['max_dgap_mm']}mm "
                 f"차이가 난다. 점별 화소 오차가 그대로 표면 요철로 보이기 "
                 f"때문이다.")
+    if depth:
+        caveats.append(
+            f"검출 화소로 푼 3D 를 raycast 참값과 직접 맞대면 깊이 치우침 "
+            f"{depth['z_bias_mm']:+.2f}mm, 산포 {depth['z_noise_mm']:.2f}mm "
+            f"({depth['n_points']:,}점)이다. 평활도는 점별 깊이 오차가 그대로 "
+            f"결과이므로, 이 산포가 목표 ±2mm 를 넘으면 평활도는 측정불가다.")
     xl = XLS.save_excel(os.path.join(out_dir, f"{name}_품질검측조서.xlsx"), res,
                         meta=meta, seg_image_path=seg, extra_caveats=caveats,
                         detection=det_eval, end_to_end=e2e,
                         triangulation=tri, g_hat=cap["g_hat"],
-                        pointcloud_image=pc3d,
+                        pointcloud_image=pc3d, detection_image=ov,
+                        depth_check=depth, pixel_source=src,
                         pc_stride=max(1, int(pc_stride)))
     print()
     if ov:
@@ -1115,6 +1283,10 @@ def main():
                     help="선검출 픽셀오차 가정 [px]. 기본은 프로파일 값")
     ap.add_argument("--no-detect-eval", action="store_true",
                     help="선검출 정확도 대조를 건너뛴다 (느릴 때)")
+    ap.add_argument("--source", default="detected",
+                    choices=["detected", "gt"],
+                    help="검측에 넣을 화소. detected=이미지에서 검출한 것"
+                         "(기본, 실장비와 같음), gt=raycast 정답 화소(상한)")
     ap.add_argument("--pc-stride", type=int, default=20,
                     help="3D 좌표 CSV·엑셀에 N개마다 한 점 (기본 20). "
                          "그림과 요약 통계는 항상 전체 점을 쓴다")
@@ -1134,6 +1306,7 @@ def main():
         out = (os.path.join(a.out, os.path.basename(os.path.normpath(t)))
                if a.out else None)
         inspect_folder(t, out_dir=out, backend=a.backend, pc_stride=a.pc_stride,
+                       source=a.source,
                        stride=a.stride, site=a.site, sigma_u_px=a.sigma_u,
                        eval_detection=not a.no_detect_eval)
         print()
