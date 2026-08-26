@@ -719,7 +719,7 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
     rows = REPORT.region_xyz_summary(result, g_hat=g_hat)
     ws.append(["부재", "클래스", "검측", "상태", "격자선 수", "측정 점수",
                "가로선 점수", "선 구성", "깊이이득", "부재 반폭(mm)",
-               "폭 근거", "중심 X(m)", "중심 Y(m)",
+               "폭 근거", "가로선점 배치면", "중심 X(m)", "중심 Y(m)",
                "중심 Z(m)", "거리범위(m)", "가로폭(m)", "깊이폭(m)",
                "측정 구간(m)", "길이 확정?", "길이 근거"])
     for r in rows:
@@ -739,6 +739,7 @@ def _sheet_pointcloud(wb, openpyxl, result, g_hat=None, image_path=None):
             r.get("선수"), r["점수"], r.get("가로선점수", 0),
             r.get("선구성"), r.get("깊이이득_RMS"),
             r.get("부재반폭_mm"), r.get("폭_근거"),
+            r.get("가로선점_배치면"),
             r["중심_X_m"], r["중심_Y_m"], r["중심_Z_m"],
             f"{r['거리범위_m'][0]} ~ {r['거리범위_m'][1]}",
             r.get("가로폭_m"), r.get("깊이폭_m"),

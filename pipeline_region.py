@@ -415,6 +415,47 @@ def resolve_by_line_gaps(result, aux_lines_uv, camera_params, g_hat):
     return n_ok
 
 
+def _ray_cylinder(uh, vh, b, axis_pt, axis_dir, radius):
+    """
+    카메라 광선과 원통면의 **앞쪽** 교점 깊이 Z.
+
+    광선  P(Z) = (b, 0, 0) + Z·(û, v̂, 1)
+    원통  축을 지나는 직선에서 거리가 radius 인 점들
+
+    축 방향 성분을 빼고 나면 평면 위의 원-직선 교차가 된다.
+
+        |O⊥ + Z·D⊥|² = R²
+        aZ² + 2βZ + γ = 0,  a=|D⊥|², β=O⊥·D⊥, γ=|O⊥|²−R²
+
+    두 근 중 작은 양수(카메라에 가까운 쪽)가 보이는 앞면이다. 광선이
+    원통을 스치지 못하면(판별식 < 0) NaN 을 돌려주고, 호출부가 그 화소를
+    이 부재에 배정하지 않는다.
+    """
+    d = np.asarray(axis_dir, float)
+    O = np.array([float(b), 0.0, 0.0]) - np.asarray(axis_pt, float)
+    D = np.column_stack([uh, vh, np.ones_like(uh)])
+    O_par = float(O @ d)
+    Op = O - O_par * d                      # (3,)
+    D_par = D @ d                           # (N,)
+    Dp = D - D_par[:, None] * d[None, :]    # (N,3)
+    A = np.einsum("ij,ij->i", Dp, Dp)
+    B = Dp @ Op
+    C = float(Op @ Op) - float(radius) ** 2
+    disc = B * B - A * C
+    # 실루엣에 스치는 광선은 버린다. 접점 근처에서는 두 근이 붙어 깊이가
+    # 조금만 흔들려도 크게 튄다 — 실측에서 그 때문에 원통 반지름(25.8mm)
+    # 보다 깊은 30.2mm 짜리 점이 생겼다. 기하상 앞면의 깊이 폭은 R 을
+    # 넘을 수 없으므로, 그런 값이 나온다는 것 자체가 스침의 증거다.
+    guard = (0.20 * float(radius) * np.sqrt(np.maximum(A, 0.0))) ** 2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        sq = np.sqrt(np.maximum(disc, 0.0))
+        z1 = (-B - sq) / A
+        z2 = (-B + sq) / A
+    Z = np.where(z1 > 0.05, z1, z2)
+    Z = np.where((disc >= guard) & (A > 1e-12) & (Z > 0.05), Z, np.nan)
+    return Z
+
+
 def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):
     """
     깊이를 못 주는 선(굴리지 않은 가로선)의 화소를 **이미 맞춘 면 위에**
@@ -496,17 +537,54 @@ def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):
                 hw = float(ax.get("radius_est_mm") or 0.0) / 1000.0
             if hw <= 1e-4:
                 hw = 0.05
-            # 창의 중심 — 끊김에서 부재 중심을 되돌렸으면 그리로 옮긴다.
+            # ── 접평면이 아니라 **원통면** 에 올린다 ──
+            # 세로선 한 줄은 연직 원통을 곧은 직선으로 자른다(연직면 ∩
+            # 연직 원통 = 직선). 그래서 세로선만으로는 둥근 게 보일 수가
+            # 없다 — 실측 u 편차 0.0000px 로 확인했다. 둥근 것은 부재를
+            # 가로지르는 **가로선** 이 보여 줘야 하는데, 그 점을 시선에
+            # 수직인 접평면에 올려 놓고 있었다. 그러면 정의상 깊이가
+            # 일정해져 원통이 판판한 띠가 된다(실측 Z 폭 0.000mm).
+            #
+            # 지름은 이미 재 놓았으므로(가로선 끊김 폭) 광선과 원통을
+            # 제대로 만나게 할 수 있다.
+            #
+            #     |O⊥ + Z·D⊥|² = R²      (축 성분을 뺀 나머지)
+            #
+            # 두 근 중 **가까운 쪽** 이 카메라가 보는 앞면이다. 이러면
+            # 가로선 점이 부재를 감싸고, 가장자리에서 깊이가 최대 R 만큼
+            # 되돌아온다 — 그게 실제 레이저가 맺힌 모습이다.
+            lat = np.cross(dv, n)
+            nl = np.linalg.norm(lat)
+            lat = lat / nl if nl > 1e-6 else None
+            z0 = float(np.median(P[:, 2]))
             off = float(r.get("center_offset_px") or 0.0)
-            if abs(off) > 0.5:
-                lat = np.cross(dv, n)
-                nl = np.linalg.norm(lat)
-                if nl > 1e-6:
-                    z0 = float(np.median(P[:, 2]))
-                    c0 = c0 + (lat / nl) * (off * z0 / f)
+            # 세로선이 맞은 자리는 **표면** 이다. 중심은 옆으로 a 만큼,
+            # 깊이로 √(R²−a²) 만큼 뒤에 있다.
+            a_m = (off * z0 / f) if lat is not None else 0.0
+            c0 = np.asarray(ax.get("centroid", P.mean(axis=0)), float)
+            if lat is not None and abs(off) > 0.5:
+                c0 = c0 + lat * a_m
+            R = hw if hw > 1e-4 else 0.0
+            # 원통으로 올리려면 **지름과 중심을 둘 다** 이 부재에서 재야
+            # 한다. 지름만 빌려 오고 중심을 세로선 자리로 가정하면, 세로선이
+            # 부재 가장자리를 맞은 경우 원통이 옆으로 밀려 앉아 광선이 먼
+            # 쪽 면을 스친다 — 실측에서 앞면 깊이 폭이 반지름(25.8mm)보다
+            # 큰 30.2mm 로 나왔다. 기하상 불가능한 값이니 그 배치가 틀린
+            # 것이다. 못 재면 접평면 그대로 두고 그 사실을 남긴다.
+            own = (r.get("width_source") == "가로선 끊김 폭"
+                   and r.get("center_offset_px") is not None)
+            use_cyl = bool(R > 1e-3 and R < 0.5 and own)
+            r["aux_surface"] = (
+                "원통면 (지름·중심 실측)" if use_cyl
+                else ("접평면 (중심 미측정 — 둥글게 그리면 지어내는 것)"
+                      if R > 1e-3 else "접평면 (지름 미상)"))
+            if use_cyl:
+                back = float(np.sqrt(max(R * R - a_m * a_m, 0.0)))
+                c0 = c0 + n * back          # 표면 → 중심으로 뒤로 민다
             s_ax = P @ dv
-            cands.append({"idx": k, "n": n, "d": -t, "shape": "axis",
-                          "axis_dir": dv, "axis_pt": c0,
+            cands.append({"idx": k, "n": n, "d": -t,
+                          "shape": "cylinder" if use_cyl else "axis",
+                          "axis_dir": dv, "axis_pt": c0, "radius": R,
                           "lat_max": hw * 1.1 + 0.004,
                           "s_lo": float(s_ax.min()) - margin_m,
                           "s_hi": float(s_ax.max()) + margin_m})
@@ -525,10 +603,14 @@ def place_aux_points(results, aux_lines_uv, camera_params, margin_m=0.12):
         best_z = np.full(len(A), np.inf)
         best_i = np.full(len(A), -1, dtype=int)
         for c in cands:
-            n, d = c["n"], c["d"]
-            den = n[0] * uh + n[1] * vh + n[2]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                Z = -(d + n[0] * b) / den
+            if c["shape"] == "cylinder":
+                Z = _ray_cylinder(uh, vh, b, c["axis_pt"], c["axis_dir"],
+                                  c["radius"])
+            else:
+                n, d = c["n"], c["d"]
+                den = n[0] * uh + n[1] * vh + n[2]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    Z = -(d + n[0] * b) / den
             P = np.column_stack([b + Z * uh, Z * vh, Z])
             ok = np.isfinite(Z) & (Z > 0.05) & (Z < 60.0) & (Z < best_z)
             if c["shape"] == "plane":

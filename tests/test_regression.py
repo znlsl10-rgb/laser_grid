@@ -1099,6 +1099,79 @@ def test_member_span_reporting():
           res2["regions"][0].get("length_is_lower_bound") is False)
 
 
+def test_cylinder_aux_surface():
+    """[19] 동바리에 맺힌 가로선 점이 원통을 감싸는가"""
+    print("\n[19] 원통면 배치 — '동바리가 둥글게 안 나온다'")
+    f, b, cx, cy = 1593.0, 0.15, 1224.0, 1024.0
+    R, Zc = 0.0243, 1.70                       # Ø48.6 동바리, 중심 깊이
+
+    # 연직 원통을 가로지르는 광선들 — 부재 폭 안에서 u 를 훑는다
+    lat = np.linspace(-0.85 * R, 0.85 * R, 41)
+    u = (lat - b) * f / (Zc - R) + cx          # 대략 앞면에 맞도록
+    uh = (u - cx) / f
+    vh = np.zeros_like(uh)
+    d = np.array([0.0, 1.0, 0.0])
+    c0 = np.array([0.0, 0.0, Zc])
+    Z = PIPE._ray_cylinder(uh, vh, b, c0, d, R)
+    ok = np.isfinite(Z)
+    check(f"광선 {int(ok.sum())}/{len(Z)} 이 원통을 맞는다", ok.sum() >= 30)
+    P = np.column_stack([b + Z[ok] * uh[ok], Z[ok] * vh[ok], Z[ok]])
+    q = P - c0
+    rad = np.linalg.norm(q - np.outer(q @ d, d), axis=1)
+    check(f"모든 점이 축에서 정확히 R 만큼 ({rad.mean()*1000:.3f}±"
+          f"{rad.std()*1000:.3f}mm, R={R*1000:.1f}mm)",
+          abs(rad.mean() - R) < 1e-6 and rad.std() < 1e-6)
+    check(f"앞면이다 (깊이 < 중심)", float(P[:, 2].max()) < Zc + 1e-9)
+    span = float(np.ptp(P[:, 2]))
+    check(f"깊이가 휜다 — 폭 {span*1000:.1f}mm (평면이면 0, 반지름 넘으면 "
+          f"기하 불가)", 0.002 < span <= R + 1e-9)
+
+    # 스치는 광선은 버린다 — 접점 근처에서 깊이가 튀는 것을 막는다
+    graze = PIPE._ray_cylinder(np.array([(0.0 - b) * f / Zc / f + R / Zc]),
+                               np.zeros(1), b, c0, d, R)
+    check("실루엣을 스치는 광선은 배정하지 않는다",
+          not np.isfinite(graze[0]) or abs(graze[0] - Zc) < R)
+
+    # 원통을 아예 빗나가면 NaN
+    miss = PIPE._ray_cylinder(np.array([0.5]), np.zeros(1), b, c0, d, R)
+    check("빗나간 광선은 NaN", not np.isfinite(miss[0]))
+
+    # 지름·중심을 못 잰 부재는 둥글게 그리지 않는다 (지어내지 않기)
+    u_c = cx + f * (0.0 - b) / (Zc - R)
+
+    def region(width_source, center_off):
+        y = np.linspace(-0.5, 0.5, 200)
+        P = np.column_stack([np.zeros_like(y), y,
+                             np.full_like(y, Zc - R)])
+        r = {"class": "shoring", "kind": "axis_vertical", "status": "measured",
+             "point_xyz": P, "point_uv": np.column_stack(
+                 [np.full_like(y, u_c), np.linspace(200, 1800, 200)]),
+             "axis": {"direction": [0.0, 1.0, 0.0],
+                      "centroid": [0.0, 0.0, Zc - R]},
+             "point_uv_box": [u_c, 200.0, u_c, 1800.0],
+             "half_width_m": R, "width_source": width_source,
+             "judge": {"is_pass": True}, "flatness": {}}
+        if center_off is not None:
+            r["center_offset_px"] = center_off
+        return r
+
+    cp = {"f_px": f, "b_m": b, "cx_px": cx, "cy_px": cy}
+    # 화소는 X=0 인 부재를 보는 광선이어야 한다. X = b + Z·û 이므로
+    # û = (0 − b)/Z — 주점(cx)이 아니라 그만큼 옆이다. 이걸 틀리면
+    # 광선이 부재를 150mm 빗나가고 "원통면인데 안 휘네" 로 보인다.
+    lines = {"H0": np.column_stack([
+        np.linspace(u_c - 18, u_c + 18, 60), np.full(60, cy)])}
+    for src, off, want in (("가로선 끊김 폭", 0.0, True),
+                           ("같은 장면의 다른 부재 폭", None, False),
+                           ("기본값(폭 미측정)", None, False)):
+        rr = [region(src, off)]
+        PIPE.place_aux_points(rr, lines, cp)
+        A = rr[0].get("aux_point_xyz")
+        curved = A is not None and len(A) and float(np.ptp(A[:, 2])) > 1e-6
+        check(f"폭 근거 '{src}' → {'원통면' if want else '접평면'} "
+              f"({rr[0].get('aux_surface')})", bool(curved) == want)
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -1111,7 +1184,8 @@ def main():
               test_pointcloud_export, test_rolled_grid_detection,
               test_run_pipeline_inputs, test_single_line_member,
               test_silhouette_recovery, test_line_gap_recovery,
-              test_pointcloud_plot, test_member_span_reporting):
+              test_pointcloud_plot, test_member_span_reporting,
+              test_cylinder_aux_surface):
         t()
     print("\n" + "=" * 70)
     if _FAILS:
