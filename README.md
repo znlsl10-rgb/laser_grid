@@ -15,6 +15,15 @@
 
 레이저 격자 이미지 하나만 있으면 엑셀 조서가 나온다. IMU·정답값·장면 사진은 있으면 넣고 없으면 비워 둔다.
 
+노트북 없이 **셀 두 줄**로 돌리려면 — 파일을 올려 두고:
+
+```python
+!wget -q -O colab_run.py "https://raw.githubusercontent.com/znlsl10-rgb/laser_grid/main/colab_run.py?v=$RANDOM"
+%run colab_run.py
+```
+
+`colab_run.py` 는 실행할 때마다 저장소를 원격 최신본으로 맞추고(fetch + reset --hard), **자기 자신도 최신본으로 갈아탄 뒤** 돌린다. 코드를 고치면 다음 실행에 그대로 반영된다. 입력은 올려 둔 파일에서 이름이 아니라 **내용으로** 가른다(레이저 신호 세기·json 스키마).
+
 ## 파이프라인
 
 ```
