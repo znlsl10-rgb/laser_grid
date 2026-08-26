@@ -254,8 +254,9 @@ def groups_from_result(result, g_hat=None, by="member", frame="gravity",
         A = r.get("aux_point_xyz")
         if A is not None and len(A):
             Aw = _tf(A)
+            surf = (r.get("aux_surface") or "투영").split(" (")[0]
             groups.append({
-                "label": f"{key} 가로선 ({len(Aw):,}점, 투영)",
+                "label": f"{key} 가로선 ({len(Aw):,}점, {surf})",
                 "label_en": f"{key} H-lines ({len(Aw):,}, projected)",
                 "color": tuple(np.asarray(col, float) * 0.72),
                 "xyz": Aw, "aux": True})

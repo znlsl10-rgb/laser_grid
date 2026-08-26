@@ -1171,6 +1171,43 @@ def test_cylinder_aux_surface():
         check(f"폭 근거 '{src}' → {'원통면' if want else '접평면'} "
               f"({rr[0].get('aux_surface')})", bool(curved) == want)
 
+    # 왜 안 둥근가 — 선검출이 아니라 기하의 한계임을 조서가 말하는가
+    res = {"regions": [{"class": "shoring", "kind": "axis_vertical",
+                        "status": "measured",
+                        "aux_surface": "접평면 (지름 미상)"}]}
+    note = PIPE.roundness_note(res, {"H0": float("inf"), "V0": 1.0})
+    check("가로선이 깊이를 못 주면 이유를 적는다",
+          bool(note) and "선검출 문제가 아니다" in note and "1/sin" in note)
+    check("가로선이 깊이를 주면 그런 말을 하지 않는다",
+          PIPE.roundness_note(res, {"H0": 1.41, "V0": 1.41}) is None)
+
+    # 격자를 굴리면 지름 가정 없이 원통면이 복원되는가
+    EQ = EQ7
+    Rr, Zc2 = 0.0243, 1.70
+    for gam, want in ((0.0, False), (10.0, True), (45.0, True)):
+        n = EQ.plane_normal("beta", np.radians(-6.0),
+                            roll_rad=np.radians(gam))
+        if not np.isfinite(EQ.depth_gain(n)):
+            check(f"굴림 {gam:.0f}° → 가로선으로 깊이 복원 불가", not want)
+            continue
+        th = np.linspace(-1.15, 1.15, 300)
+        X = Rr * np.sin(th)
+        Z0 = Zc2 - Rr * np.cos(th)
+        Y = -(n[0] * X + n[2] * Z0) / n[1]
+        P = np.column_stack([X, Y, Z0])
+        P = P[np.abs(Y) < 1.0]
+        u = 1593.0 * (P[:, 0] - 0.15) / P[:, 2] + 1224.0
+        v = 1593.0 * P[:, 1] / P[:, 2] + 1024.0
+        xyz, _k = EQ.triangulate_plane(np.column_stack([u, v]), n,
+                                       1593.0, 0.15, 1224.0, 1024.0)
+        q = xyz - np.array([0.0, 0.0, Zc2])
+        q[:, 1] = 0.0
+        rms = float(np.sqrt(np.mean(
+            (np.linalg.norm(q, axis=1) - Rr) ** 2)))
+        check(f"굴림 {gam:.0f}° → 참 원통면 잔차 {rms*1000:.3f}mm "
+              f"(지름 가정 없음)", want and rms < 1e-4)
+
+
 
 def main():
     print("=" * 70)

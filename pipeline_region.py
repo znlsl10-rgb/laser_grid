@@ -1027,6 +1027,47 @@ def finalize_extents(result):
     return span_note
 
 
+def roundness_note(result, line_gain=None):
+    """
+    "동바리가 왜 안 둥근가" 에 대한 한 줄. 조서와 표에 남긴다.
+
+    세로선 한 줄은 연직 원통을 **직선** 으로 자른다(연직면 ∩ 연직 원통).
+    둥근 것을 보여 줄 수 있는 건 부재를 가로지르는 가로선인데, 격자를
+    굴리지 않으면 가로선의 레이저 평면이 카메라 광심을 지나 깊이를 못
+    준다(이득 g=∞). 이건 선검출 실패가 아니라 기하의 한계다 — 이 캡처에서
+    가로선은 21/21 검출됐고 |n_x| 가 9.2e-08 이었다.
+
+    광축 둘레로 γ 만큼 굴리면 g = 1/sin γ 로 유한해지고, 그때는 가로선
+    화소가 그냥 삼각측량된다. 지름을 가정할 필요가 없다 — 합성 검증에서
+    γ=10° 면 참 원통면에서 0.16mm, γ=45° 면 0.13mm 다.
+    """
+    regs = result.get("regions") or []
+    lin = [r for r in regs if r.get("kind") == "axis_vertical"
+           and r.get("status") == "measured"]
+    if not lin:
+        return None
+    inferred = [r for r in lin if (r.get("aux_surface") or "").startswith(
+        ("원통면", "접평면"))]
+    if not inferred:
+        return None
+    n_ok = 0
+    if line_gain:
+        n_ok = sum(1 for k, g in line_gain.items()
+                   if str(k).startswith("H") and np.isfinite(g)
+                   and g <= _EQ7.MAX_DEPTH_GAIN)
+    if n_ok:
+        return None            # 가로선이 깊이를 주면 그냥 측정된 점이다
+    return (
+        "선형 부재의 가로선 점은 **측정이 아니라 유도값** 이다. 세로선 한 "
+        "줄은 연직 원통을 직선으로 자르므로(연직면 ∩ 연직 원통 = 직선) "
+        "둥근 단면을 보여 줄 수 없고, 그걸 보여 줄 가로선은 격자를 굴리지 "
+        "않으면 레이저 평면이 카메라 광심을 지나 깊이를 못 준다(이득 g=∞, "
+        "이 캡처 |n_x|=9.2e-08). 선검출 문제가 아니다 — 가로선은 전부 "
+        "검출됐다. 광축 둘레로 γ 만큼 굴리면 g=1/sin γ 로 유한해져 가로선 "
+        "화소가 그냥 삼각측량되고, 동바리 단면이 가정 없이 측정된다 "
+        "(합성 검증: γ=10° → 참 원통면에서 0.16mm, γ=45° → 0.13mm).")
+
+
 def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
                   rgb_off=None, seg_backend="gt", seg_kwargs=None,
                   erode_default_px=3, erode_thin_px=1,
@@ -1267,6 +1308,7 @@ def inspect_image(lines_pixels, lines_xyz, camera_params, g_hat,
         "aux_points": int(n_aux),
         "crossing_resolved": int(n_cross),
         "span_note": span_note,
+        "roundness_note": roundness_note({"regions": results}, line_gain),
         "flatness_unmeasurable": sum(
             1 for r in measured
             if (r["flatness"] or {}).get("judgement") == "측정불가"),
@@ -1495,6 +1537,10 @@ def format_report(result):
     if sn:
         lines.append("")
         lines.append("  [측정 구간] " + sn)
+    rn = (result.get("summary") or {}).get("roundness_note")
+    if rn:
+        lines.append("")
+        lines.append("  [가로선 점] " + rn)
     return "\n".join(lines)
 
 

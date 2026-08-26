@@ -865,10 +865,11 @@ def save_excel(path, result, meta=None, label_pixels=None,
     _sheet_defects(wb, openpyxl, result, seg_image_path)
     _sheet_pointcloud_xyz(wb, openpyxl, result, g_hat=g_hat, stride=pc_stride)
     # '동바리 높이가 제각각' 으로 읽히는 것을 막는 설명은 조서에도 남긴다.
-    _sn = (result.get("summary") or {}).get("span_note")
+    _summ = result.get("summary") or {}
     _cav = list(extra_caveats or [])
-    if _sn:
-        _cav.insert(0, _sn)
+    for _k in ("roundness_note", "span_note"):
+        if _summ.get(_k):
+            _cav.insert(0, _summ[_k])
     _sheet_caveats(wb, openpyxl, record, _cav)
     # 탭 순서를 파이프라인 순서로 맞춘다 — 선검출 → 깊이 → 분할/3D → 검측
     order = ["1.요약", "2.설계값", "3.선검출(1단계)", "4.깊이검증(2단계)",
