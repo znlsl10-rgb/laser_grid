@@ -185,13 +185,31 @@ def _looks_like_imu(d):
         x in d for x in ("pitch_deg", "roll_deg", "gravity", "accel"))
 
 
-def _laser_score(path, repo_dir=None):
-    """
-    레이저 이미지인가 — 레이저 신호가 강하게 뜨는 화소 비율.
+# 이 내보내기의 이름 규약. 이름이 있으면 그게 가장 확실한 단서다.
+_LASER_NAMES = ("cast", "laser", "_on", "on_", "grid", "레이저")
+_SCENE_NAMES = ("cam", "scene", "_off", "off_", "배경", "장면")
 
-    파일 이름에 기대지 않는다. CAST/CAM 같은 규약을 모르는 사람이 올린
-    사진도 가려야 하고, 반대로 이름만 맞고 내용이 다른 경우도 있다.
-    채널(초록·빨강·파랑)은 저장소의 laser_signal 이 이미지에서 판별한다.
+
+def _name_hint(path):
+    """파일 이름이 무엇이라고 말하는가. (레이저?, 장면?)"""
+    n = os.path.basename(path).lower()
+    return (any(k in n for k in _LASER_NAMES),
+            any(k in n for k in _SCENE_NAMES))
+
+
+def _laser_score(path):
+    """
+    레이저가 **얼마나 또렷하게 분리돼 있는가**.
+
+    처음에는 "신호가 문턱을 넘는 화소 비율" 로 쟀는데 틀렸다. 그 값은
+    선이 굵고 배경이 밝을수록 커져서, 얇은 선이 검은 배경에 있는 raycast
+    (CAST.png, 0.089)보다 밝은 장면에 격자가 얹힌 카메라 렌더(CAM.png,
+    0.111)를 레이저 이미지로 골랐다. 그대로 돌아가 깊이 오차 181mm 가
+    나왔는데 판정은 합격으로 찍혔다.
+
+    분리도로 재야 한다. 신호의 상위 분위수와 중앙값의 차를, 배경의
+    흩어짐(중앙값 절대편차)으로 나눈다 — 배경이 잡음뿐이면 크고, 배경에
+    무늬가 많으면 작다. 배율과 밝기에 안 흔들린다.
     """
     try:
         from PIL import Image
@@ -204,11 +222,10 @@ def _laser_score(path, repo_dir=None):
             s = LS.laser_signal(a)
         except Exception:                 # 저장소를 아직 못 붙였을 때
             s = a[:, :, 1] - 0.5 * (a[:, :, 0] + a[:, :, 2])
-        hi = float(np.percentile(s, 99.5))
         med = float(np.median(s))
-        if hi - med < 1e-6:
-            return 0.0
-        return float((s > med + 0.5 * (hi - med)).mean())
+        hi = float(np.percentile(s, 99.5))
+        mad = float(np.median(np.abs(s - med)))
+        return (hi - med) / max(mad, 0.5)
     except Exception:
         return -1.0
 
@@ -270,17 +287,35 @@ def find_inputs(dirs=None, image=None, verbose=True):
             raise FileNotFoundError(
                 "레이저 격자 이미지를 못 찾았습니다. 왼쪽 파일 탭에 끌어다 "
                 "놓거나 files.upload() 로 올린 뒤 다시 실행하세요.")
-        scored = sorted(((_laser_score(p), p) for p in imgs), reverse=True)
-        out["image"] = scored[0][1]
-        rest = [p for _s, p in scored[1:]]
-        if verbose and len(scored) > 1:
-            print("[입력] 레이저 신호 세기로 고름: " + ", ".join(
-                f"{os.path.basename(p)} {s:.3f}" for s, p in scored[:4]))
+        # 이름이 말해 주면 그걸 먼저 믿는다 — 이 내보내기는 CAST/CAM 규약이
+        # 있고, 신호만 보는 추정보다 훨씬 확실하다. 이름이 없을 때만 잰다.
+        named = [p for p in imgs if _name_hint(p)[0]]
+        if len(named) == 1:
+            out["image"] = named[0]
+            rest = [p for p in imgs if p is not named[0]]
+            if verbose:
+                print(f"[입력] 이름 규약으로 고름: "
+                      f"{os.path.basename(named[0])}")
+        else:
+            pool = named or imgs
+            scored = sorted(((_laser_score(p), p) for p in pool), reverse=True)
+            out["image"] = scored[0][1]
+            rest = [p for p in imgs
+                    if os.path.realpath(p)
+                    != os.path.realpath(out["image"])]
+            if verbose and len(scored) > 1:
+                print("[입력] 레이저 분리도로 고름: " + ", ".join(
+                    f"{os.path.basename(p)} {s:.1f}" for s, p in scored[:4]))
     if rest:
-        # 남은 이미지 중 신호가 가장 약한 것이 레이저 OFF 사진일 가능성
-        s_rest = sorted((_laser_score(p), p) for p in rest)
-        if s_rest and s_rest[0][0] >= 0:
-            out["scene_image"] = s_rest[0][1]
+        # 배경으로 쓸 장면 사진 — 이름이 말해 주면 그걸, 아니면 분리도가
+        # 가장 낮은 것(=레이저가 덜 도드라진 쪽)을 쓴다.
+        named_bg = [p for p in rest if _name_hint(p)[1]]
+        if named_bg:
+            out["scene_image"] = named_bg[0]
+        else:
+            s_rest = sorted((_laser_score(p), p) for p in rest)
+            if s_rest and s_rest[0][0] >= 0:
+                out["scene_image"] = s_rest[0][1]
 
     if verbose:
         print("[입력]")
