@@ -38,7 +38,6 @@ C_영역분할.py — [품질검측 알고리즘 C] 현장 이미지 영역 분�
 import numpy as np
 
 try:
-    from sklearn.linear_model import RANSACRegressor, LinearRegression
     from sklearn.cluster import DBSCAN
     HAS_SKLEARN = True
 except ImportError:

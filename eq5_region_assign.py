@@ -57,8 +57,6 @@ PLANE_HORIZONTAL_CLASSES = {"floor", "slab", "ceiling"}
 LINEAR_VERTICAL_CLASSES = {"shoring", "column", "rebar"}   # 동바리·기둥·철근
 IGNORE_CLASSES = {"background", "clutter", "equipment", "unknown"}
 
-# 평활도(eq4) 대상 — 선형 부재는 원통면이므로 평활도가 성립하지 않는다
-FLATNESS_CLASSES = PLANE_VERTICAL_CLASSES | PLANE_HORIZONTAL_CLASSES
 
 MEASURE_KIND = {}
 for _c in PLANE_VERTICAL_CLASSES:   MEASURE_KIND[_c] = "plane_vertical"

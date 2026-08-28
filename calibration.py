@@ -79,7 +79,6 @@ EDGE_MARGIN_PX = 50.0       # design 센서 가장자리 여유
 
 # 정확도 목표 (PDF 1.1)
 TARGET_SIGMA_MM = 2.0       # spec  평활도 ±2mm
-TARGET_ANGLE_DEG = 0.5      # spec  수직·수평도 ±0.5°
 
 # ---------------------------------------------------------------------
 # 렌즈 초점거리 — PDF 가 값을 주지 않은 유일한 광학 상수
@@ -127,7 +126,6 @@ SIGMA_U_PX = 0.2            # assumed 서브픽셀 반복성. 실장비 측정 �
 
 SENSOR_COLOR = "color"      # spec  PDF 3.1 "RGB 영상 … 컬러"
 OPTICAL_FILTER_NM = None    # PDF 에 없음
-LASER_POWER_MW_SPEC = LASER_POWER_MW
 
 
 # =====================================================================

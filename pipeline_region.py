@@ -45,11 +45,6 @@ _EQ7 = _load("eq7_laser_plane")
 _EQ8 = _load("eq8_silhouette")
 _SEG = _load("C_영역분할")
 
-# 평활도 허용 기준 (PDF 1.2 표: 노출 콘크리트 3m당 7mm, 미장 1m당 10mm 등).
-# 면적 기준이 아니라 구간 기준이므로 영역 크기와 함께 판정한다.
-FLATNESS_TOL_MM = {"wall": 7.0, "plaster_wall": 10.0, "masonry": 10.0,
-                   "formwork_wall": 7.0, "formwork_column": 7.0,
-                   "floor": 10.0, "slab": 10.0, "ceiling": 3.0}
 
 
 # =====================================================================

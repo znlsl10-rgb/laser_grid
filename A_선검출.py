@@ -65,12 +65,6 @@ def _load(_name):
 # 굴린 격자(roll)에서는 선이 이미지에서 기울어 예측식이 달라진다.
 _EQ7 = _load("eq7_laser_plane")
 _LSIG = _load("laser_signal")
-try:
-    from scipy.optimize import curve_fit as _curve_fit
-    _SCIPY = True
-except ImportError:
-    _SCIPY = False
-
 # 다중면 모드 플래그. _trace_line 은 detect 인자를 직접 받지 못하므로
 # 모듈 전역으로 전달한다(호출 진입점이 detect 하나뿐이라 안전).
 _MULTI_SURFACE = [False]
@@ -1280,10 +1274,6 @@ def _steger_subpixel(idx, weights, pred, band):
     w_sum    = w.sum()
     centroid = float(np.dot(idx, w) / (w_sum + 1e-9))
     return 0.75 * mu + 0.25 * centroid
-
-
-def _gauss1d(x, A, mu, sigma, C):
-    return A * np.exp(-0.5 * ((x - mu) / (sigma + 1e-9))**2) + C
 
 
 # =====================================================================

@@ -62,7 +62,6 @@ KCS_NOTE = {
 
 _HDR_BG = "1F2937"
 _HDR_FG = "FFFFFF"
-_SEC_BG = "E5E7EB"
 
 
 def _rgb_hex(rgb):

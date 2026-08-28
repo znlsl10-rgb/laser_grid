@@ -1209,6 +1209,63 @@ def test_cylinder_aux_surface():
 
 
 
+def test_hardware_contract():
+    """[20] 실장비 입력 규약 — 무엇이 없으면 막고, 무엇이면 경고인가"""
+    print("\n[20] 하드웨어 입력 규약 (hardware.py)")
+    HW = _load("hardware")
+    import tempfile
+    from PIL import Image
+
+    bad, _w, _i = HW.check_params(HW.template())
+    check(f"빈 서식은 필수 {len(bad)}건을 다 잡는다",
+          len(bad) == len(HW.REQUIRED))
+
+    good = {"camera": {"f_px": 1593.0, "cx_px": 1224.0, "cy_px": 1024.0,
+                       "sensor_W": 2448, "sensor_H": 2048},
+            "baseline_m": 0.15,
+            "grid": {"n_vertical": 21, "n_horizontal": 21, "fov_deg": 60.8},
+            "laser": {"roll_deg": 0.0, "tilt_deg": 0.0}}
+    bad, warn, info = HW.check_params(good)
+    check("갖춘 사양은 통과", not bad)
+    check(f"기선·초점거리로 깊이잡음을 미리 알려준다 "
+          f"({info.get('깊이잡음_mm@1.7m_σu0.3px')}mm @1.7m)",
+          0.5 < (info.get("깊이잡음_mm@1.7m_σu0.3px") or 0) < 20)
+    check("굴림 0° 면 '가로선이 깊이를 못 준다' 고 경고",
+          any("굴림" in w for w in warn))
+    g2 = dict(good); g2["laser"] = {"roll_deg": 20.0, "tilt_deg": 0.0}
+    check("굴림 20° 면 그 경고가 없다",
+          not any("굴림" in w for w in HW.check_params(g2)[1]))
+
+    # 초점거리를 빼면 막아야 한다 — 깊이가 통째로 배율만큼 틀리기 때문
+    g3 = {"camera": {"cx_px": 1224.0, "cy_px": 1024.0,
+                     "sensor_W": 2448, "sensor_H": 2048},
+          "baseline_m": 0.15}
+    check("f_px 가 없으면 막는다",
+          any("camera.f_px" in m for m in HW.check_params(g3)[0]))
+
+    with tempfile.TemporaryDirectory() as td:
+        a = np.zeros((160, 240, 3), np.uint8)
+        a[:, ::20, 1] = 255
+        Image.fromarray(a).save(os.path.join(td, "laser_on.png"))
+        import json as _j
+        _j.dump(good, open(os.path.join(td, "camera_params.json"), "w"))
+        r = HW.check_capture(td, verbose=False)
+        check("이미지 + 사양만 있으면 '검측 가능'", r["ok"])
+        d = r["이미지"]["laser_on"]
+        check(f"이진 렌더를 잡아낸다 ({d['이진(안티에일리어싱 없음)']})",
+              d["이진(안티에일리어싱 없음)"] is True)
+        check("OFF 프레임·IMU 가 없으면 경고로 남긴다",
+              any("OFF" in w for w in r["경고"])
+              and any("IMU" in w for w in r["경고"]))
+        os.remove(os.path.join(td, "camera_params.json"))
+        check("사양 파일이 없으면 막는다",
+              not HW.check_capture(td, verbose=False)["ok"])
+        os.remove(os.path.join(td, "laser_on.png"))
+        _j.dump(good, open(os.path.join(td, "camera_params.json"), "w"))
+        check("이미지가 없으면 막는다",
+              not HW.check_capture(td, verbose=False)["ok"])
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -1222,7 +1279,7 @@ def main():
               test_run_pipeline_inputs, test_single_line_member,
               test_silhouette_recovery, test_line_gap_recovery,
               test_pointcloud_plot, test_member_span_reporting,
-              test_cylinder_aux_surface):
+              test_cylinder_aux_surface, test_hardware_contract):
         t()
     print("\n" + "=" * 70)
     if _FAILS:

@@ -34,7 +34,6 @@ except ImportError:
 TARGETS = {"wall": "wall_verticality_deg",
            "floor": "floor_horizontality_deg",
            "shoring": "shoring_verticality_deg"}
-TOL_DEG = 0.5
 
 
 def perturb_mask(label_map, mode, amount, rng, bg_id=0):
