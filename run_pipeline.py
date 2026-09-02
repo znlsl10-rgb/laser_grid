@@ -145,6 +145,24 @@ def gravity_from_imu(imu=None):
     return g / n, src, False
 
 
+def _dig(d, path):
+    """'a.b.c' 로 중첩 dict 를 훑는다. 없으면 None."""
+    cur = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur
+
+
+def _first(*vals):
+    """None 이 아닌 첫 값."""
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
 def _params_from_file(path, img_w, img_h):
     """
     camera_params.json → 검측용 카메라 파라미터.
@@ -176,13 +194,37 @@ def _params_from_file(path, img_w, img_h):
                               grid.get("n_h", CALIB.N_HORIZONTAL))),
           "fov_h_deg": float(grid.get("fov_deg", CALIB.FOV_DEG)),
           "fov_v_deg": float(grid.get("fov_deg", CALIB.FOV_DEG)),
-          "laser_tilt_deg": float(grid.get("laser_tilt_deg",
-                                           CALIB.LASER_TILT_DEG)),
-          "laser_roll_deg": float(grid.get("laser_roll_deg",
-                                           CALIB.LASER_ROLL_DEG))}
+          # 굴림·수렴각은 세 자리 중 어디에 적어도 읽는다. 업체마다
+          # 자연스러운 위치가 달라서, 한 자리만 받으면 값을 적어 놓고도
+          # 0 으로 돌아가는 사고가 난다 — 굴림이 0 이면 가로선이 깊이를
+          # 못 주므로 결과가 통째로 달라진다.
+          "laser_tilt_deg": float(_first(
+              _dig(d, "laser.tilt_deg"), grid.get("laser_tilt_deg"),
+              d.get("laser_tilt_deg"), CALIB.LASER_TILT_DEG)),
+          "laser_roll_deg": float(_first(
+              _dig(d, "laser.roll_deg"), grid.get("laser_roll_deg"),
+              d.get("laser_roll_deg"), CALIB.LASER_ROLL_DEG))}
     cp["sensor_w"], cp["sensor_h"] = float(sensor[0]), float(sensor[1])
-    return cp, {"출처": _os.path.basename(path),
-                "센서→이미지 배율": (round(su, 4), round(sv, 4))}
+    # 선별 레이저 평면 법선을 직접 쟀다면 각도 모델보다 그쪽이 정확하다.
+    # 평면 하나에 자유도 3 이라 굴림·수렴각·왜곡이 그 안에 다 흡수된다.
+    lines = d.get("lines")
+    if isinstance(lines, dict):
+        given = {}
+        for lid, v in lines.items():
+            n = (v or {}).get("normal") if isinstance(v, dict) else None
+            if n is None or len(n) != 3:
+                continue
+            n = np.asarray(n, float)
+            nn = float(np.linalg.norm(n))
+            if nn > 1e-9:
+                given[str(lid)] = (n / nn).tolist()
+        if given:
+            cp["line_normals"] = given
+    meta = {"출처": _os.path.basename(path),
+            "센서→이미지 배율": (round(su, 4), round(sv, 4))}
+    if cp.get("line_normals"):
+        meta["평면 법선 직접 지정"] = f"{len(cp['line_normals'])}개 선"
+    return cp, meta
 
 
 def _params_from_profile(img_w, img_h):
@@ -390,11 +432,24 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
 
 
 def _line_angles(cp, truth_path=None):
-    """검측에 쓸 선별 발사각·평면 법선."""
-    return CALIB.make_line_angles(
+    """
+    검측에 쓸 선별 발사각·평면 법선.
+
+    camera_params 에 선별 법선(lines.*.normal)이 들어 있으면 그것을 쓰고,
+    없으면 발사각 모델로 만든다. 법선을 직접 재 오는 편이 가정이 적다 —
+    평면 하나에 자유도 3 이고 굴림·수렴각·렌즈 왜곡이 그 안에 흡수된다.
+    """
+    la = CALIB.make_line_angles(
         n_v=cp["n_v"], n_h=cp["n_h"], fov_deg=cp["fov_h_deg"],
         laser_tilt_deg=cp.get("laser_tilt_deg", 0.0),
         laser_roll_deg=cp.get("laser_roll_deg", 0.0))
+    given = cp.get("line_normals") or {}
+    for lid, n in given.items():
+        if lid in la:
+            la[lid] = dict(la[lid])
+            la[lid]["normal"] = list(n)
+            la[lid]["depth_gain"] = EQ7.depth_gain(np.asarray(n, float))
+    return la
 
 
 # =====================================================================

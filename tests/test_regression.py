@@ -10,6 +10,7 @@ Isaac 환경에서 inspection.py 를 돌려야 한다.
 ========================================================================
 """
 import sys, os
+import json
 import numpy as np
 import importlib.util as ilu
 
@@ -1264,6 +1265,53 @@ def test_hardware_contract():
         _j.dump(good, open(os.path.join(td, "camera_params.json"), "w"))
         check("이미지가 없으면 막는다",
               not HW.check_capture(td, verbose=False)["ok"])
+
+    # ── 규약서·검사기·파서가 같은 자리를 보는가 ──
+    # 이 셋이 어긋나면 업체가 값을 제대로 적어 놓고도 0 으로 돌아간다.
+    # 굴림이 0 이면 가로선이 깊이를 못 주므로 결과가 통째로 달라진다.
+    import tempfile as _tf
+    base = {"camera": {"f_px": 1593.0, "cx_px": 1224.0, "cy_px": 1024.0,
+                       "sensor_W": 2448, "sensor_H": 2048},
+            "baseline_m": 0.15,
+            "grid": {"n_vertical": 5, "n_horizontal": 5, "fov_deg": 60.0}}
+
+    def _parse(extra):
+        d = json.loads(json.dumps(base))
+        d.update(extra)
+        with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as fp:
+            json.dump(d, fp)
+            path = fp.name
+        cp, meta = RP._params_from_file(path, 2448, 2048)
+        la = RP._line_angles(cp)
+        os.unlink(path)
+        return cp, meta, la
+
+    for nm, extra in (
+            ("laser 블록", {"laser": {"roll_deg": 20.0, "tilt_deg": 6.0}}),
+            ("grid 안", {"grid": dict(base["grid"], laser_roll_deg=20.0,
+                                     laser_tilt_deg=6.0)}),
+            ("최상위", {"laser_roll_deg": 20.0, "laser_tilt_deg": 6.0})):
+        cp, _m, la = _parse(extra)
+        gh = float(np.median([v["depth_gain"] for k, v in la.items()
+                              if k.startswith("H")]))
+        check(f"굴림·수렴각을 '{nm}' 에 적어도 읽는다 "
+              f"(roll {cp['laser_roll_deg']:.0f}°, H선 이득 {gh:.2f})",
+              abs(cp["laser_roll_deg"] - 20.0) < 1e-9
+              and abs(cp["laser_tilt_deg"] - 6.0) < 1e-9
+              and np.isfinite(gh))
+    cp0, _m0, la0 = _parse({})
+    check("안 적으면 0 으로 두고 가로선 이득은 무한(깊이 못 줌)",
+          cp0["laser_roll_deg"] == 0.0
+          and not np.isfinite(float(np.median(
+              [v["depth_gain"] for k, v in la0.items()
+               if k.startswith("H")]))))
+
+    cpn, mn, lan = _parse({"lines": {"V0": {"normal": [3.0, 0.0, 4.0]}}})
+    check(f"선별 평면 법선을 직접 주면 그대로 쓴다 "
+          f"({mn.get('평면 법선 직접 지정')}, 정규화 "
+          f"{[round(x, 3) for x in lan['V0']['normal']]})",
+          np.allclose(lan["V0"]["normal"], [0.6, 0.0, 0.8])
+          and abs(lan["V0"]["depth_gain"] - 1.0) < 1e-9)
 
 
 def main():

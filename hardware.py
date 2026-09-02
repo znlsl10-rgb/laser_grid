@@ -82,6 +82,9 @@ hardware.py — 실장비에서 무엇을 받아야 하는가 (규약 + 검사�
   · 부재 하나에 세로선이 **2줄 이상** 걸리게. 한 줄이면 단면이 안 풀려
     수직도를 절반만 재고 판정보류가 된다.
 
+업체에 넘기는 규약서(좌표계 정의·납품 체크리스트 포함):
+    docs/하드웨어_인터페이스_규약.md
+
 이 파일을 직접 실행하면 자체 검증이 돈다:  python3 hardware.py
 ========================================================================
 """
@@ -97,8 +100,10 @@ SOURCE = {"measured": "실측(캘리브레이션)", "spec": "데이터시트",
 
 REQUIRED = ("camera.f_px", "camera.cx_px", "camera.cy_px",
             "camera.sensor_W", "camera.sensor_H", "baseline_m")
-RECOMMENDED = ("grid.n_vertical", "grid.n_horizontal", "grid.fov_deg",
-               "laser.roll_deg", "laser.tilt_deg")
+RECOMMENDED = ("grid.n_vertical", "grid.n_horizontal", "grid.fov_deg")
+# 굴림·수렴각은 세 자리 중 어디에 적어도 된다(파서가 다 읽는다).
+ROLL_KEYS = ("laser.roll_deg", "grid.laser_roll_deg", "laser_roll_deg")
+TILT_KEYS = ("laser.tilt_deg", "grid.laser_tilt_deg", "laser_tilt_deg")
 
 IMG_ON = ("laser_on", "cast", "_on", "on_", "grid", "레이저")
 IMG_OFF = ("laser_off", "cam", "scene", "_off", "off_", "배경", "장면")
@@ -148,6 +153,8 @@ def check_params(params):
     for k in RECOMMENDED:
         if _dig(params, k) is None:
             warn.append(f"권장 값 없음: {k}")
+    if all(_dig(params, k) is None for k in TILT_KEYS):
+        warn.append("권장 값 없음: 수렴각 (laser.tilt_deg 등) — 0 으로 가정")
 
     f = _dig(params, "camera.f_px")
     b = params.get("baseline_m")
@@ -161,7 +168,11 @@ def check_params(params):
         if float(b) < 0.05:
             warn.append(f"기선이 {float(b)*1000:.0f}mm 로 짧다 — 깊이 잡음이 "
                         f"기선에 반비례한다")
+    # 파서가 읽는 세 자리를 그대로 본다 — 규약서와 검사기와 파서가
+    # 서로 다른 자리를 보면, 값을 적어 놓고도 0 으로 도는 사고가 난다.
     roll = _dig(params, "laser.roll_deg")
+    if roll is None:
+        roll = _dig(params, "grid.laser_roll_deg")
     if roll is None:
         roll = params.get("laser_roll_deg")
     if roll is not None:
