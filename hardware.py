@@ -12,9 +12,19 @@ numpy, Pillow 뿐입니다.
     python3 hardware.py <촬영.zip>              zip 도 그대로
     python3 hardware.py --template              camera_params.json 빈 서식
     python3 hardware.py --demo                  맞는 예제를 만들어 보여 준다
+    python3 hardware.py --notebook              코랩용 .ipynb 생성
     python3 hardware.py                         자체 검증
 
-코랩에서는 이 파일을 올린 뒤 셀에서:
+코랩에서 쓰려면 — `--notebook` 으로 만든 .ipynb 를 여는 것이 가장 쉽습니다.
+이 파일(.py)을 코랩 "노트북 열기" 창에 바로 넣으면 JSON 이 아니라며 막힙니다.
+그 창은 .ipynb 만 받습니다.
+
+    python3 hardware.py --notebook     →  촬영점검_코랩.ipynb
+
+만든 .ipynb 를 코랩에서 열고 셀을 차례로 실행하면 됩니다. 점검기 소스가
+노트북 안에 통째로 들어가므로 인터넷도 저장소도 필요 없습니다.
+
+이미 코랩에 이 .py 를 올려 두었다면(왼쪽 파일 탭에 끌어다 놓기) 셀에서:
 
     import hardware; hardware.colab()
 
@@ -1251,6 +1261,120 @@ def demo(out_dir="예제촬영", roll_deg=20.0, verbose=True):
 
 
 # =====================================================================
+# 코랩 노트북 만들기 — 이 파일이 자기 자신을 담은 .ipynb 를 낸다
+# =====================================================================
+def notebook(path="촬영점검_코랩.ipynb"):
+    """
+    코랩에서 **바로 열리는** 노트북 하나를 만든다.
+
+    왜 필요한가
+    ----------
+    코랩의 "노트북 열기" 창은 .ipynb(JSON) 만 받는다. 거기에 .py 를 넣으면
+    파이썬 소스를 JSON 으로 파싱하려다
+
+        Unexpected token '#', "#!/usr/bin"... is not valid JSON
+
+    로 터진다. 파일이 잘못된 게 아니라 넣는 자리가 다른 것이다.
+
+    그래서 이 점검기의 소스를 **첫 셀에 통째로 담은** 노트북을 만든다.
+    받는 쪽은 노트북 하나만 열면 되고, 인터넷도 저장소도 필요 없다.
+    """
+    with open(_os.path.abspath(__file__), encoding="utf-8") as fp:
+        src = fp.read()
+
+    def md(t):
+        return {"cell_type": "markdown", "metadata": {},
+                "source": t.splitlines(keepends=True)}
+
+    def code(t):
+        return {"cell_type": "code", "metadata": {}, "execution_count": None,
+                "outputs": [], "source": t.splitlines(keepends=True)}
+
+    cells = [
+        md("""# 촬영 데이터 점검 — 이 데이터를 검측에 써도 되는가
+
+장비에서 나온 촬영 한 벌이 검측 소프트웨어에 쓸 수 있는 상태인지 확인합니다.
+**셀을 위에서부터 차례로 실행**하시면 됩니다. 설치할 것도, 받아야 할 것도
+없습니다.
+
+점검은 세 단계입니다.
+
+1. **파일이 있는가** — 빠진 것이 있으면 그 자리에서 막습니다.
+2. **이미지가 쓸 만한가** — 저장 형식·노출·선폭·레이저 채널 분리.
+3. **사양이 이미지와 맞는가** ← 핵심.
+   `camera_params.json` 에 적힌 초점거리를 믿지 않고 **이미지에서 직접 재어**
+   견줍니다. 선 사이 간격은 초점거리와 발사각만으로 정해지고 거리·기선과는
+   무관하기 때문입니다. 굴림각도 이미지에서 재서 대조합니다.
+
+파일은 다 갖췄는데 사양의 숫자가 다른 장비의 것이면, 검측은 그대로 돌아가고
+**결과만 조용히 틀립니다.** 그 상태를 여기서 잡습니다."""),
+        md("## 1. 점검기 준비\n\n아래 셀을 한 번 실행하면 끝입니다."),
+        code("%%writefile hardware.py\n" + src),
+        md("""## 2. 먼저 예제로 — 통과하면 이렇게 나옵니다
+
+규약을 만족하는 촬영 한 벌을 만들어 점검해 봅니다. 내 데이터 결과와 견줄
+기준이 됩니다."""),
+        code("!python3 hardware.py --demo"),
+        md("""## 3. 내 촬영 점검하기
+
+아래 셀을 실행하면 업로드 창이 뜹니다.
+
+* **zip 하나**를 올려도 되고,
+* `laser_on.png` · `camera_params.json` 같은 **파일 여러 개를 한꺼번에**
+  골라 올려도 됩니다.
+
+zip 안에 촬영 폴더가 여럿이면 각각 따로 점검하고 끝에 요약표를 냅니다.
+
+| 파일 | 필수? | 없으면 |
+|---|:---:|---|
+| `laser_on.png` | **필수** | 점검할 수 없습니다 |
+| `camera_params.json` | **필수** | 깊이가 통째로 배율만큼 틀립니다 |
+| `laser_off.png` | 권장 | 햇빛 드는 현장에서 선을 놓칠 수 있습니다 |
+| `imu.json` | 권장 | 장비가 똑바로 섰다고 가정합니다 |
+| `truth.json` | 선택 | 현장에는 없어도 됩니다 |"""),
+        code("import hardware\nchk = hardware.colab()"),
+        md("""### 결과 읽는 법
+
+판정은 셋입니다.
+
+* **검측 가능** — 이대로 쓰시면 됩니다.
+* **사양과 이미지가 어긋난다** — 파일은 다 있지만 숫자가 이 이미지의 것이
+  아닙니다. `[불일치]` 항목에 무엇이 몇 % 다른지 나옵니다.
+* **검측 불가** — 필수 항목이 빠졌습니다.
+
+`[경고]` 는 돌아가지만 정확도나 판정 등급에 영향을 줍니다.
+
+점검이 끝나면 **`점검결과.json`** 이 자동으로 내려받아집니다. 그 파일을
+그대로 회신해 주시면 됩니다."""),
+        md("""### 기선(baseline)은 사진 한 장으로 검증할 수 없습니다
+
+깊이 식에 기선 `b` 와 거리 `Z` 가 **`b/Z` 로만** 들어옵니다. 그래서 '기선
+2배'와 '거리 2배'가 화면에서 완전히 같아, 사진만으로는 구분되지 않습니다.
+
+검증하시려면 **거리를 자로 잰 촬영**을 한 벌 넣고 `camera_params.json` 에
+
+```json
+"측정거리_m": 1.50
+```
+
+처럼 적어 주세요. 그러면 점검기가 복원한 거리와 대조해 기선 오류를
+잡아냅니다. 이 값이 없으면 "기선을 검증할 수 없다" 는 경고만 남깁니다."""),
+        md("## 4. 사양 파일 서식이 필요하면"),
+        code("!python3 hardware.py --template\n"
+             "print(open('camera_params.json', encoding='utf-8').read())"),
+    ]
+    doc = {"nbformat": 4, "nbformat_minor": 0,
+           "metadata": {"colab": {"provenance": [], "toc_visible": True},
+                        "kernelspec": {"name": "python3",
+                                       "display_name": "Python 3"},
+                        "language_info": {"name": "python"}},
+           "cells": cells}
+    with open(path, "w", encoding="utf-8") as fp:
+        _json.dump(doc, fp, ensure_ascii=False, indent=1)
+    return path
+
+
+# =====================================================================
 # CLI
 # =====================================================================
 def main(argv=None):
@@ -1260,6 +1384,12 @@ def main(argv=None):
         _json.dump(template(), open(out, "w", encoding="utf-8"),
                    ensure_ascii=False, indent=2)
         print(f"서식을 썼다: {out}")
+        return 0
+    if a and a[0] == "--notebook":
+        out = notebook(a[1] if len(a) > 1 else "촬영점검_코랩.ipynb")
+        print(f"코랩 노트북을 썼다: {out}")
+        print("  코랩 → 파일 → 노트북 업로드 로 이 .ipynb 를 여세요.")
+        print("  (.py 를 '노트북 열기' 창에 넣으면 JSON 이 아니라며 막힙니다)")
         return 0
     if a and a[0] == "--demo":
         d = demo(a[1] if len(a) > 1 else "예제촬영")

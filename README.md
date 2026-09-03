@@ -36,6 +36,7 @@ python3 hardware.py <촬영폴더>          # 검측을 돌려도 되는가
 python3 hardware.py <폴더들…> <zip>     # 여러 벌 한꺼번에
 python3 hardware.py --template          # camera_params.json 빈 서식
 python3 hardware.py --demo              # 규약을 만족하는 예제
+python3 hardware.py --notebook          # 코랩용 .ipynb (업체 배포본)
 ```
 
 를 돌리면 무엇이 없는지 항목별로 답한다. 규약을 글로만 두면 실제 파일이

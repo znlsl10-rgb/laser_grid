@@ -1314,6 +1314,31 @@ def test_hardware_contract():
     finally:
         _sh.rmtree(_t, ignore_errors=True)
 
+    # ── 코랩용 노트북 — .py 를 "노트북 열기" 에 넣으면 막히므로 ──
+    _t2 = _td.mkdtemp()
+    try:
+        nbp = HW.notebook(os.path.join(_t2, "촬영점검_코랩.ipynb"))
+        nb = json.load(open(nbp, encoding="utf-8"))
+        codes = ["".join(c["source"]) for c in nb["cells"]
+                 if c["cell_type"] == "code"]
+        check(f"코랩 노트북이 유효한 JSON 이고 셀이 있다 ({len(nb['cells'])}셀)",
+              nb.get("nbformat") == 4 and len(codes) >= 3)
+        # 첫 셀은 점검기 소스를 통째로 담는다 — 인터넷도 저장소도 없이 돈다
+        head, body = codes[0].split("\n", 1)
+        src = open(os.path.join(ROOT, "hardware.py"), encoding="utf-8").read()
+        check("첫 셀이 점검기 소스를 그대로 담는다 (자체 완결)",
+              head.strip() == "%%writefile hardware.py" and body == src,
+              f"{len(body)/1024:.0f} KB")
+        # 그 소스가 실제로 도는가
+        import subprocess
+        open(os.path.join(_t2, "hardware.py"), "w", encoding="utf-8").write(body)
+        r = subprocess.run([sys.executable, "hardware.py", "--demo"],
+                           cwd=_t2, capture_output=True, text=True)
+        check("노트북에서 꺼낸 소스가 그대로 돈다",
+              r.returncode == 0 and "검측 가능" in r.stdout)
+    finally:
+        _sh.rmtree(_t2, ignore_errors=True)
+
     # ── 파이프라인은 규약을 만족하는 촬영만 받는다 ──
     try:
         RP.run(image="/dev/null", params=None, verbose=False)
