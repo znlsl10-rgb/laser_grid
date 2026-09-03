@@ -405,10 +405,14 @@ def resolve_by_line_gaps(result, aux_lines_uv, camera_params, g_hat):
         if not res.get("ok"):
             continue
         sh = res.get("shadow") or {}
+        # 예측 폭은 find_shadow_edges 쪽 결과에만 있는 값이라, 이 경로
+        # (member_edges_from_lines)에서는 없는 게 정상이다. 그대로 찍으면
+        # 조서에 "예측 Nonepx" 가 실린다.
+        want = sh.get("expected_width_px")
         detail = (f"가로선 {res['n_lines']}줄이 부재를 지나며 생긴 끊김"
-                  f"(폭 중앙값 {sh.get('gap_px')}px, 예측 "
-                  f"{sh.get('expected_width_px')}px)의 부재 쪽 끝을 높이별로 "
-                  f"뽑아")
+                  f"(폭 중앙값 {sh.get('gap_px')}px"
+                  + (f", 예측 {want}px" if want else "")
+                  + ")의 부재 쪽 끝을 높이별로 뽑아")
         _apply_lateral(r, res, "가로선 화소 끊김 (eq8)", detail)
         n_ok += 1
     return n_ok
