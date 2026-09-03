@@ -1,0 +1,29 @@
+{
+  "camera": {
+    "f_px": 796.5,
+    "cx_px": 611.5,
+    "cy_px": 511.5,
+    "sensor_W": 1224,
+    "sensor_H": 1024
+  },
+  "baseline_m": 0.15,
+  "grid": {
+    "n_vertical": 15,
+    "n_horizontal": 15,
+    "fov_deg": 60.0
+  },
+  "laser": {
+    "roll_deg": 20.0,
+    "tilt_deg": 0.0,
+    "wavelength_nm": 520
+  },
+  "sensor_size": [
+    1224,
+    1024
+  ],
+  "screenshot_size": [
+    1224,
+    1024
+  ],
+  "case_name": "example_capture"
+}

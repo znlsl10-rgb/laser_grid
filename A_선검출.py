@@ -180,26 +180,38 @@ def detect(rgb_image, lines_pixels_raycast, line_angles, camera_params,
         diff_v, diff_h = diff * mv, diff * mh
         print(f"  [A] 굴린 격자 (V선 {np.degrees(ang_v):+.1f}° / "
               f"H선 {np.degrees(ang_h):+.1f}°) → 계열 분리 + 방향 추적")
-        z_ref = float(camera_params.get("standoff_z", 1.2))
-        if z_ref > 10:
-            z_ref /= 1000.0
+        # 기준 깊이는 "가장 큰 면" 이 아니라 **덮어야 할 깊이 구간의 시차
+        # 한가운데** 로 잡는다. 시차는 1/Z 에 비례하므로 조화평균이 가운데다.
+        # 배경 벽에 맞추면 그 앞에 선 부재가 밴드 밖으로 밀려난다.
+        z_lo, z_hi = _z_span(camera_params)
+        z_ref = 2.0 / (1.0 / z_lo + 1.0 / z_hi)
         f = float(camera_params.get("f_px", 2318.8))
         b = float(camera_params.get("b_m", 0.150))
         cx = float(camera_params.get("cx_px", W_img / 2.0))
         cy = float(camera_params.get("cy_px", H_img / 2.0))
         out = {}
+        # 깊이 구간이 만드는 시차 반폭 [px]. 선 하나가 z_lo~z_hi 안에서
+        # 법선 방향으로 움직이는 거리는 이 값을 깊이 이득 g 로 나눈 것이다
+        # (V선 g≈1 은 많이, 굴린 H선 g≈3 은 1/3 만 움직인다).
+        reach0 = 0.5 * abs(f * b * (1.0 / z_lo - 1.0 / z_hi))
         for lids, src, fb in ((v_lids, diff_v, spacing_v),
                               (h_lids, diff_h, spacing_h)):
             sp = _perp_spacings(lids, line_angles, z_ref, f, b, fb)
             for lid in lids:
                 nrm = line_angles[lid]["normal"]
-                # 밴드는 수직 간격의 40% 를 넘기지 않는다. 넘기면 이웃 선의
-                # 능선이 밴드에 들어와 무게중심이 그쪽으로 끌린다.
-                bd = max(8.0, min(float(sp[lid]) * 0.40, 60.0))
+                # 밴드는 (1) 깊이 구간을 덮을 만큼 넓고 (2) 수직 간격의
+                # 45% 를 넘지 않아야 한다. 좁으면 배경보다 앞에 선 부재가
+                # 통째로 빠지고(실측: 반폭을 간격의 25% 로 못 박았더니
+                # 2.5m 벽 앞 1.62m 동바리가 137점밖에 안 잡혔다), 넓으면
+                # 이웃 선 능선이 들어와 무게중심이 끌린다.
+                reach = reach0 / max(_EQ7.depth_gain(np.asarray(nrm, float)),
+                                     1e-6)
+                lim = float(sp[lid]) * 0.45
+                bd = max(8.0, min(reach + _subpix_half + 2.0, lim, 60.0))
                 pts = _trace_line_oriented(
                     src, nrm, z_ref, f, b, cx, cy, (H_img, W_img), band=bd,
                     subpix_half=_subpix_half,
-                    max_offset=float(sp[lid]) * 0.25)
+                    max_offset=min(reach + 2.0, lim))
                 if len(pts) >= 10:
                     out[lid] = pts
         ok_v = sum(1 for l in v_lids if len(out.get(l, [])) >= 10)
@@ -807,6 +819,39 @@ def _perp_spacings(lids, line_angles, z_ref, f, b, fallback):
     return out
 
 
+def _spurious_steps(resid, thr, reach, min_run=4):
+    """
+    선을 따라 매끄러움에서 벗어난 걸음 중 **버려야 할 것** 을 고른다.
+
+    법선 좌표가 s 에 대해 매끄럽다는 가정은 면 하나 위에서만 맞다. 배경
+    앞에 부재가 서 있으면 그 구간에서 좌표가 통째로 옮겨 앉는데, 그것은
+    오검출이 아니라 **재야 할 대상** 이다. 매끄러움만 보고 자르면 부재가
+    통째로 지워진다(실측: 2.5m 벽 앞 1.62m 동바리에 레이저 화소가 2,603개
+    맺혔는데 검출 점은 108개만 남았다 — H선마다 딱 1점씩이었다).
+
+    그래서 두 가지로 가른다.
+
+    · **길이** — 교점에서 옆 능선을 잠깐 문 자리는 한두 걸음이고, 부재
+      위를 걸은 자리는 수십 걸음 이어진다.
+    · **거리** — 부재가 만드는 어긋남은 시차이므로 추적 밴드가 덮는 깊이
+      구간 안에서 설명되어야 한다(reach). 그보다 멀리 옮겨 앉았다면 깊이로
+      설명할 수 없는 값, 곧 옆 선의 능선을 문 것이다.
+
+    둘 중 하나라도 걸리면 버린다.
+    """
+    resid = np.asarray(resid, float)
+    bad = resid > float(thr)
+    drop = np.zeros_like(bad)
+    if not bad.any():
+        return drop
+    idx = np.where(bad)[0]
+    lim = float(reach)
+    for grp in np.split(idx, np.where(np.diff(idx) > 1)[0] + 1):
+        if len(grp) < int(min_run) or float(np.median(resid[grp])) > lim:
+            drop[grp] = True
+    return drop
+
+
 def _trace_line_oriented(diff, normal, z_ref, f, b, cx, cy, img_size,
                          band=24.0, subpix_half=4, step=1.0,
                          rel_frac=0.20, min_weight=2.0, miss_limit=40,
@@ -922,6 +967,9 @@ def _trace_line_oriented(diff, normal, z_ref, f, b, cx, cy, img_size,
     # 켜진 폭이 평소보다 넓은 걸음을 버린다 (_trace_line 과 같은 규칙).
     w = np.asarray(lit_w, float)
     wmed = float(np.median(w))
+    # 이 컷은 그대로 둔다 — 켜진 폭이 넓다는 것은 "면이 다르다" 가 아니라
+    # "이 걸음의 무게중심이 두 능선에 걸쳐 뭉개졌다" 는 뜻이라, 매끄러움
+    # 가정과 달리 부재 위에서도 그대로 유효한 품질 신호다.
     keep = w <= max(wmed * 2.0, wmed + 2.0)
     if keep.sum() >= 10:
         P, sarr = P[keep], sarr[keep]
@@ -938,7 +986,8 @@ def _trace_line_oriented(diff, normal, z_ref, f, b, cx, cy, img_size,
             r = d_n - np.polyval(co, t01)
             mad = float(np.median(np.abs(r - np.median(r))))
             thr = max(3.0 * 1.4826 * mad, 1.0)
-            good = np.abs(r - np.median(r)) <= thr
+            good = ~_spurious_steps(np.abs(r - np.median(r)), thr,
+                                    off_cap + 2.0)
             if good.sum() >= 10:
                 P = P[good]
         except Exception:

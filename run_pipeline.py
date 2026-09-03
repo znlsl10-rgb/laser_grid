@@ -338,7 +338,27 @@ def _line_positions(mask_1d, min_gap=3):
     return np.array([g.mean() for g in groups if len(g) >= 1])
 
 
-def read_grid_from_image(rgb, occupancy=0.35):
+def _occupancy_peaks(coord, lit, occupancy, min_capacity=0.25):
+    """
+    1픽셀 폭 띠마다 "켜진 화소 / 그 띠에 들어오는 화소" 를 재어 선을 찾는다.
+
+    굴리지 않은 격자에서는 열 평균 하나면 됐다. 격자를 굴리면 선이 열을
+    가로질러 어느 열도 채우지 못한다 — 그래서 축이 아니라 **선 방향으로
+    되돌린 좌표** 로 띠를 잡는다. 띠의 길이가 화면 모서리에서 짧아지므로
+    분모(수용량)를 같이 세어 비율로 본다.
+    """
+    lo = int(np.floor(coord.min())); hi = int(np.ceil(coord.max())) + 1
+    edges = np.arange(lo, hi + 1, dtype=float)
+    cap, _ = np.histogram(coord, bins=edges)
+    got, _ = np.histogram(coord[lit], bins=edges)
+    keep = cap >= min_capacity * max(np.median(cap[cap > 0]) if (cap > 0).any()
+                                     else 0.0, 1.0)
+    ratio = np.zeros(len(cap), float)
+    ratio[keep] = got[keep] / cap[keep]
+    return _line_positions(ratio >= occupancy) + lo
+
+
+def read_grid_from_image(rgb, occupancy=0.35, roll_rad=0.0, cx=None, cy=None):
     """
     격자 이미지에서 V/H 선의 픽셀 위치를 읽는다.
 
@@ -349,6 +369,22 @@ def read_grid_from_image(rgb, occupancy=0.35):
     임계를 분위수로 잡으면 안 된다. 선이 차지하는 화소는 전체의 몇 %뿐이라
     90% 분위수가 배경값이 되고, 그러면 화면 전체가 선으로 잡힌다. 신호의
     중앙값과 최대값 사이에서 잡아야 한다.
+
+    굴린 격자(roll_rad≠0)
+    --------------------
+    굴림은 레이저 평면 법선을 광축 둘레로 γ 만큼 돌린다. 그러면 **모든**
+    V선이 화면에서 정확히 γ 만큼 기운다(발사각과 무관하다 — 법선의
+    x성분만 회전하기 때문). 20° 굴린 1224×1024 화면에서 V선 하나는
+    u 를 373px 가로지르므로, 어느 열도 35% 를 채우지 못해 축 투영으로는
+    선이 하나도 안 잡힌다(실측: 예제 촬영에서 거리 추정이 통째로 실패해
+    2.50m 벽이 1.05m 로 나왔다).
+
+    그래서 좌표를 −γ 만큼 되돌려 읽는다. 되돌린 좌표
+
+        u' = c_x + (u−c_x)·cos γ + (v−c_y)·sin γ
+
+    에서는 굴리지 않은 식 u' = f·tan α − f·b/Z + c_x 가 그대로 성립한다.
+    이미지가 아니라 좌표를 돌리므로 리샘플링 오차가 없다.
     """
     # 채널은 laser_signal 이 이미지에서 판별한다(초록·빨강·파랑, 못 가르면
     # 밝기). 여기서 초록으로 못박으면 빨간 레이저에서 통째로 실패한다.
@@ -358,11 +394,24 @@ def read_grid_from_image(rgb, occupancy=0.35):
     if hi - med < 1e-6:
         return np.array([]), np.array([])
     m = signal >= med + 0.4 * (hi - med)
-    # 열별·행별 점유율. V선이 지나는 열은 대부분의 행이 켜져 있고,
-    # 그렇지 않은 열은 H선이 지나는 몇 행만 켜져 있다.
-    v = _line_positions(m.mean(axis=0) >= occupancy)
-    h = _line_positions(m.mean(axis=1) >= occupancy)
-    return v, h
+    if abs(float(roll_rad)) < 1e-9:
+        # 열별·행별 점유율. V선이 지나는 열은 대부분의 행이 켜져 있고,
+        # 그렇지 않은 열은 H선이 지나는 몇 행만 켜져 있다.
+        v = _line_positions(m.mean(axis=0) >= occupancy)
+        h = _line_positions(m.mean(axis=1) >= occupancy)
+        return v, h
+    Hh, Ww = m.shape
+    cx = 0.5 * Ww if cx is None else float(cx)
+    cy = 0.5 * Hh if cy is None else float(cy)
+    uu, vv = np.meshgrid(np.arange(Ww, dtype=np.float32) + 0.5,
+                         np.arange(Hh, dtype=np.float32) + 0.5)
+    du, dv = uu - cx, vv - cy
+    c, s = np.cos(float(roll_rad)), np.sin(float(roll_rad))
+    up = (cx + du * c + dv * s).ravel()
+    vp = (cy - du * s + dv * c).ravel()
+    lit = m.ravel()
+    return (_occupancy_peaks(up, lit, occupancy),
+            _occupancy_peaks(vp, lit, occupancy))
 
 
 def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
@@ -394,9 +443,11 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
     -------
     dict — z_est_m, flipped, resid_m, n_matched, ok
     """
-    u_img, _ = read_grid_from_image(rgb)
     f, b = float(cp["f_px"]), float(cp["b_m"])
     cx, cy = float(cp["cx_px"]), float(cp["cy_px"])
+    u_img, _ = read_grid_from_image(
+        rgb, roll_rad=np.radians(float(cp.get("laser_roll_deg", 0.0) or 0.0)),
+        cx=cx, cy=cy)
     alphas = np.array(sorted(
         v["angle_rad"] for k, v in line_angles.items() if k.startswith("V")))
     best = None
@@ -429,6 +480,43 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
     best["ok"] = True
     best["n_lines_read"] = int(len(u_img))
     return best
+
+
+def _depth_band(cp, line_angles, z_est, behind=1.15, safety=0.8):
+    """
+    선검출 추적 밴드가 덮어야 할 깊이 구간 [z_near, z_far].
+
+    왜 배율(0.7~1.4배)로 잡으면 안 되는가
+    ------------------------------------
+    거리 추정(estimate_grid_pose)이 읽는 것은 화면을 가장 많이 덮은 면,
+    보통 **배경 벽** 이다. 그런데 검측 대상인 동바리·기둥은 그 벽보다
+    **앞** 에 선다. 배경을 중심으로 대칭인 구간을 잡으면 정작 재야 할
+    부재가 밴드 밖으로 밀려나 통째로 안 잡힌다(실측: 벽 2.50m 를 읽고
+    0.7~1.4배 구간 1.88~3.75m 를 쓰자 1.62m·1.78m 동바리 두 본이 하나도
+    검출되지 않고, 대신 벽에 걸린 선분 하나가 "동바리 19.5° 기준초과"
+    로 나왔다 — 굴림각과 같은 값, 즉 레이저 선 방향 그 자체였다).
+
+    무엇이 구간의 한계인가
+    --------------------
+    깊이가 변하면 선이 시차 f·b/Z 만큼 움직인다. 그 움직임이 **이웃 선
+    간격** 을 넘으면 어느 선인지 구분이 안 된다. 그래서 구간의 한계는
+    거리에 대한 배율이 아니라
+
+        f·b·(1/z_near − 1/z_far) < (이웃 V선 최소 간격) × safety
+
+    이다. 이 한계 안에서 뒤로는 조금만(behind), 앞으로는 갈 수 있는 데까지
+    연다. V선이 H선보다 시차에 g배 더 민감하므로(H선 변위 = V선/g) V선
+    간격이 구속 조건이다.
+    """
+    f, b = float(cp["f_px"]), abs(float(cp["b_m"]))
+    al = sorted(v["angle_rad"] for k, v in line_angles.items()
+                if k.startswith("V"))
+    gap = (float(np.min(np.diff(f * np.tan(np.asarray(al)))))
+           if len(al) >= 2 else 60.0)
+    span = max(safety * gap, 1.0)                       # 허용 시차 폭 [px]
+    z_far = float(z_est) * float(behind)
+    z_near = 1.0 / (1.0 / z_far + span / max(f * b, 1e-9))
+    return [round(z_near, 4), round(z_far, 4)]
 
 
 def _line_angles(cp, truth_path=None):
@@ -765,8 +853,11 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
         say(f"  격자에서 복원   거리 {pose['z_est_m']:.3f} m  "
             f"(선 {pose['n_matched']}개, 편차 {pose['resid_m']*1000:.0f}mm)"
             + ("   화소 180° 뒤집힘" if flipped else ""))
-        # 깊이 구간을 넉넉히 잡아 밴드가 앞뒤 면을 다 덮게 한다
-        cp["z_range"] = [pose["z_est_m"] * 0.7, pose["z_est_m"] * 1.4]
+        # 깊이 구간은 배율이 아니라 이웃 선 간격이 정한다 — 배경 뒤로는
+        # 조금만, 부재가 서 있는 앞쪽으로는 갈 수 있는 데까지.
+        cp["z_range"] = _depth_band(cp, line_angles, pose["z_est_m"])
+        say(f"  추적 깊이 구간   {cp['z_range'][0]:.2f} ~ "
+            f"{cp['z_range'][1]:.2f} m")
     else:
         say(f"  [경고] 격자에서 거리를 못 풀었다 ({pose.get('reason')}). "
             f"가정값 {cp['standoff_z']}m 로 진행한다.")

@@ -180,7 +180,9 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
     # 벽의 가느다란 조각을 잘못 집지 않도록 두 가지를 함께 요구한다.
     #   · robust 축 적합이 유효하고 축 주변 점 비율이 충분할 것
     #   · 그 점들이 실제로 1D 부재로 판별될 것 (판/원통 두께비 검사)
-    for grp in _spatial_groups(pts, cluster_eps_m, min_linear_points):
+    for grp in _merge_vertical_fragments(
+            pts, _spatial_groups(pts, cluster_eps_m, min_linear_points),
+            g_hat):
         gidx = np.arange(N)[grp]
         try:
             # 혼합 덩어리에서 얇은 부재를 끄집어내는 것이 목적이므로
@@ -196,6 +198,14 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
         if len(sub) < min_linear_points:
             continue
         if _EQ5.geometric_evidence(pts[sub], g_hat)["shape"] != "linear_vertical":
+            continue
+        # 형상이 "선" 이라는 것만으로는 부재가 아니다 — 벽에 그은 레이저
+        # 선 한 줄도 3D 에서는 선이다. 벽 위 이웃 V선 간격(2.5m 에서
+        # 0.19m)이 군집 반경보다 넓어서, H선이 끊긴 자리에서는 V선 한
+        # 도막이 제 군집이 되어 여기로 올라온다. 가릴 수 있는 것은
+        # 깊이뿐이므로 주변보다 앞에 서 있는지 함께 본다.
+        if not _stands_in_front(pts, sub, g_hat, occluder_margin_m,
+                                undecided=True):
             continue
         labels[sub] = next_id
         # 기하는 동바리/기둥/철근을 구분하지 못한다 → 가장 흔한 shoring
@@ -257,7 +267,21 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
     for grp in _spatial_groups(pts[leftover], cluster_eps_m, min_linear_points):
         gidx = leftover[grp]
         ev = _EQ5.geometric_evidence(pts[gidx], g_hat)
-        if ev["shape"] == "linear_vertical":
+        if (ev["shape"] == "linear_vertical"
+                and _stands_in_front(pts, gidx, g_hat, occluder_margin_m,
+                                     undecided=True)):
+            # 형상만으로는 부족하다. **벽에 그은 레이저 선 한 줄도 3D 에서는
+            # 선** 이다 — 고유값이 [큼, 0, 0] 이라 얇은 기둥과 구분되지
+            # 않는다. 게다가 벽 위 이웃 V선은 2.5m 에서 0.19m 떨어져 있어
+            # 군집 반경(0.08m)보다 멀다. 그래서 H선이 끊긴 자리(가림 그림자,
+            # 화면 가장자리)에서는 V선 한 도막이 통째로 제 군집이 되어
+            # 부재로 올라온다(실측: 벽 화소 1,184점이 "동바리 축수직도
+            # 19.48° 기준초과" 로 나왔다 — 19.48° 는 격자 굴림각 그 자체,
+            # 곧 레이저 선 방향이었다).
+            #
+            # 가릴 수 있는 것은 깊이뿐이므로 아래 degenerate_line 갈래와
+            # 같은 검증을 건다. 다만 여기서는 형상이 이미 얇은 부재라고
+            # 말했으므로, 비교할 배경이 없을 때는 통과시킨다.
             labels[gidx] = next_id
             # 기하는 동바리/기둥/철근을 구분하지 못한다 → 가장 흔한 shoring 으로
             # 두되, meta 에 구분 불가임을 남긴다.
@@ -301,7 +325,7 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
                             if n_single_line else ""))}}
 
 
-def _stands_in_front(pts, gidx, g_hat, margin_m):
+def _stands_in_front(pts, gidx, g_hat, margin_m, undecided=False):
     """
     이 점 무리가 주변 면보다 앞에 서 있는가 (가림물인가).
 
@@ -312,10 +336,15 @@ def _stands_in_front(pts, gidx, g_hat, margin_m):
     이웃을 화면이 아니라 3D 로 고른다. 이 단계에는 화소 좌표가 없고,
     같은 시선 방향에서 더 먼 점을 찾으면 되므로 시선 각도로 이웃을
     정의하는 편이 정확하다.
+
+    비교할 이웃이 없으면 "가림물이 아니다" 가 아니라 **모른다** 이다.
+    그때 무엇으로 볼지는 부르는 쪽이 정한다(undecided). 형상이 이미 얇은
+    부재라고 말하고 있으면 모름을 통과로, 형상이 아무 말도 못 하는
+    한 줄짜리면 모름을 탈락으로 둔다.
     """
     sub = pts[gidx]
     if len(sub) < 5:
-        return False
+        return bool(undecided)
     z = float(np.median(sub[:, 2]))
     # 무리의 시선 방향(단위벡터) 중심
     d0 = sub / np.linalg.norm(sub, axis=1, keepdims=True)
@@ -323,14 +352,14 @@ def _stands_in_front(pts, gidx, g_hat, margin_m):
 
     others = np.setdiff1d(np.arange(len(pts)), gidx, assume_unique=False)
     if len(others) < 20:
-        return False
+        return bool(undecided)
     o = pts[others]
     do = o / np.linalg.norm(o, axis=1, keepdims=True)
     ang = np.degrees(np.arccos(np.clip(do @ c, -1, 1)))
     # 시야각 15° 안의 이웃 — 같은 장면 안이면서 무리 밖
     near = o[ang < 15.0]
     if len(near) < 20:
-        return False
+        return bool(undecided)
     z_bg = float(np.median(near[:, 2]))
     return (z_bg - z) > margin_m
 
@@ -418,6 +447,58 @@ def _merge_occlusion_split(all_points, member_idx, groups, plane, merge_gap_m,
     merged = {}
     for i, g in enumerate(groups):
         merged.setdefault(find(i), []).append(g)
+    return [np.concatenate(v) if len(v) > 1 else v[0] for v in merged.values()]
+
+
+def _merge_vertical_fragments(points, groups, g_hat, gap_m=0.12):
+    """
+    한 연직 부재가 격자 간격 때문에 여러 도막으로 갈린 것을 도로 합친다.
+
+    왜 필요한가
+    ----------
+    격자선은 부재를 **가로질러** 지나므로, 동바리 하나에 맺힌 점은 선마다
+    짧은 도막으로 끊겨 나온다. 도막 사이 세로 간격(1.6m 에서 ~0.12m)이
+    군집 반경(0.08m)보다 넓어서 DBSCAN 은 이것을 서로 다른 덩어리로 본다.
+    도막 하나는 부재 길이의 10분의 1도 안 되므로 축 방향이 잡히지 않고
+    (실측: 같은 동바리의 도막 6개가 θ=1.9°/4.7°/5.2°/5.4°/6.6°/7.0° 로
+    제각각), 결국 두 동바리가 통째로 하나의 "벽 평면" 으로 흡수됐다.
+
+    무엇으로 합치는가
+    ----------------
+    같은 연직 부재의 도막은 **중력 방향을 걷어낸 자리(발자국)가 같다**.
+    반면 굴린 격자의 벽 선 한 줄은 위로 갈수록 옆으로 흘러가므로(이 표본
+    에서 화면 높이만큼 올라가는 동안 u 가 373px 이동) 도막마다 발자국이
+    다르다. 그래서 발자국 거리로 가르면 부재와 벽 선이 갈린다.
+
+    가로로 넓게 퍼진 덩어리(벽·바닥)는 애초에 합침 대상이 아니다 —
+    자기 발자국이 이미 gap_m 보다 크면 건드리지 않는다.
+    """
+    g = np.asarray(g_hat, float)
+    g = g / max(np.linalg.norm(g), 1e-12)
+    foot, thin = [], []
+    for grp in groups:
+        q = points[grp]
+        q = q - np.outer(q @ g, g)              # 중력 성분을 걷어낸 발자국
+        foot.append(np.median(q, axis=0))
+        span = float(np.max(np.linalg.norm(q - np.median(q, axis=0), axis=1)))
+        thin.append(span <= gap_m)
+    parent = list(range(len(groups)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            if not (thin[i] and thin[j]):
+                continue
+            if float(np.linalg.norm(foot[i] - foot[j])) <= gap_m:
+                parent[find(i)] = find(j)
+    merged = {}
+    for i, grp in enumerate(groups):
+        merged.setdefault(find(i), []).append(np.asarray(grp))
     return [np.concatenate(v) if len(v) > 1 else v[0] for v in merged.values()]
 
 

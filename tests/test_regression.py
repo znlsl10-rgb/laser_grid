@@ -1314,6 +1314,94 @@ def test_hardware_contract():
           and abs(lan["V0"]["depth_gain"] - 1.0) < 1e-9)
 
 
+def test_sample_capture():
+    """[21] 예제 입력 데이터셋 — 참값을 되찾는가"""
+    print("\n[21] 예제 입력 데이터셋 (make_sample_capture.py)")
+    MK = _load("make_sample_capture")
+    RP = _load("run_pipeline")
+    DET = _load("A_선검출")
+    PIPE = _load("pipeline_region")
+    import io as _io
+    import contextlib
+
+    on, off, Pmap, sid, planes = MK.render()
+    check("[21] 렌더가 네 면을 모두 담는다",
+          all((sid == k).sum() > 5000 for k in (0, 1, 2, 3)),
+          ", ".join(f"{n}={int((sid == k).sum())}"
+                    for k, n in ((0, "벽"), (1, "바닥"),
+                                 (2, "동바리1"), (3, "동바리2"))))
+
+    W, H = MK.W, MK.H
+    cp = {"f_px": MK.F_PX, "cx_px": MK.CX, "cy_px": MK.CY, "b_m": MK.BASE_M,
+          "n_v": MK.N_V, "n_h": MK.N_H, "fov_h_deg": MK.FOV_DEG,
+          "fov_v_deg": MK.FOV_DEG, "laser_tilt_deg": MK.TILT_DEG,
+          "laser_roll_deg": MK.ROLL_DEG, "image_w": W, "image_h": H,
+          "resolution": [W, H], "standoff_z": 1.2}
+    la = RP._line_angles(cp)
+
+    # ── 굴린 격자에서 거리 복원 ──
+    # 축 투영만 쓰면 20° 굴림에서 V선이 한 열도 못 채워 통째로 실패한다.
+    pose = RP.estimate_grid_pose(on, cp, la)
+    check("[21] 굴린 격자에서도 거리를 푼다",
+          bool(pose.get("ok")) and abs(pose["z_est_m"] - 2.5) < 0.35,
+          f"Z={pose.get('z_est_m')} m (벽 참값 2.50 m), 선 {pose.get('n_matched')}개")
+    check("[21] 굴림을 무시하면 격자를 못 읽는다 (이 보정이 필요한 이유)",
+          len(RP.read_grid_from_image(on)[0]) < 5,
+          f"굴림 미보정 시 읽은 V선 {len(RP.read_grid_from_image(on)[0])}개 "
+          f"/ 보정 시 {len(RP.read_grid_from_image(on, roll_rad=np.radians(MK.ROLL_DEG), cx=MK.CX, cy=MK.CY)[0])}개")
+
+    # ── 추적 깊이 구간이 배경 **앞** 으로 열려야 한다 ──
+    band = RP._depth_band(cp, la, pose["z_est_m"])
+    check("[21] 깊이 구간이 배경 앞의 부재까지 덮는다",
+          band[0] < min(p["xz"][1] for p in MK.POSTS) < band[1],
+          f"구간 {band[0]:.2f}~{band[1]:.2f} m, 동바리 "
+          + "/".join(f"{p['xz'][1]:.2f}" for p in MK.POSTS) + " m")
+    cp["standoff_z"], cp["z_range"] = pose["z_est_m"], band
+
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        det = DET.detect(on, {}, la, cp, multi_surface=True)
+    cam = np.array([MK.BASE_M, 0.0, 0.0])
+    n_post = 0
+    for lid, uv in det.items():
+        uv = np.asarray(uv, float)
+        if not len(uv):
+            continue
+        D = np.stack([(uv[:, 0] - MK.CX) / MK.F_PX,
+                      (uv[:, 1] - MK.CY) / MK.F_PX, np.ones(len(uv))], axis=1)
+        D /= np.linalg.norm(D, axis=1, keepdims=True)
+        _, _, s2 = MK.trace(cam, D)
+        n_post += int(((s2 == 2) | (s2 == 3)).sum())
+    # 매끄러움 컷이 부재를 지우면 여기가 100점대로 떨어진다
+    check("[21] 배경 앞 부재의 화소가 살아남는다 (매끄러움 컷에 지워지지 않음)",
+          n_post > 900, f"동바리 검출 점 {n_post}개")
+
+    lx, luv, tri = PIPE.triangulate_lines(det, la, cp)
+    err = []
+    for lid in lx:
+        uv = np.asarray(luv[lid], float)
+        D = np.stack([(uv[:, 0] - MK.CX) / MK.F_PX,
+                      (uv[:, 1] - MK.CY) / MK.F_PX, np.ones(len(uv))], axis=1)
+        D /= np.linalg.norm(D, axis=1, keepdims=True)
+        Pt, _, _ = MK.trace(cam, D)
+        m = np.isfinite(Pt[:, 2])
+        err.append((np.asarray(lx[lid], float)[m, 2] - Pt[m, 2]) * 1000.0)
+    e = np.concatenate(err)
+    bias = float(np.median(e))
+    mad = 1.4826 * float(np.median(np.abs(e - bias)))
+    # 화소 중심 규약이 0.5px 어긋나면 여기가 30mm 대로 뛴다
+    check("[21] 깊이에 계통 오차가 없다 (화소 중심 규약 일치)",
+          abs(bias) < 5.0, f"치우침 {bias:+.2f}mm / 산포(MAD) {mad:.2f}mm")
+
+    # ── 규약 검사기 + 참값 대조 ──
+    root = os.path.join(ROOT, "samples", "example_capture")
+    if os.path.isdir(root):
+        HW = _load("hardware")
+        r = HW.check_capture(root, verbose=False)
+        check("[21] 예제 폴더가 규약 검사를 통과한다", bool(r["ok"]),
+              f"막힘 {len(r['필수문제'])}건 / 경고 {len(r['경고'])}건")
+
+
 def main():
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
@@ -1327,7 +1415,8 @@ def main():
               test_run_pipeline_inputs, test_single_line_member,
               test_silhouette_recovery, test_line_gap_recovery,
               test_pointcloud_plot, test_member_span_reporting,
-              test_cylinder_aux_surface, test_hardware_contract):
+              test_cylinder_aux_surface, test_hardware_contract,
+              test_sample_capture):
         t()
     print("\n" + "=" * 70)
     if _FAILS:
