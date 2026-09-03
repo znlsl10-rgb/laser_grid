@@ -227,21 +227,6 @@ def _params_from_file(path, img_w, img_h):
     return cp, meta
 
 
-def _params_from_profile(img_w, img_h):
-    """사양 프로파일을 이미지 해상도에 맞춰 낸다."""
-    cp = CALIB.scale_to_resolution(img_w)
-    cp = {**cp, "image_w": img_w, "image_h": img_h,
-          "n_v": CALIB.N_VERTICAL, "n_h": CALIB.N_HORIZONTAL,
-          "fov_h_deg": CALIB.FOV_DEG, "fov_v_deg": CALIB.FOV_DEG,
-          "laser_tilt_deg": CALIB.LASER_TILT_DEG,
-          "laser_roll_deg": CALIB.LASER_ROLL_DEG}
-    cp["cy_px"] = img_h / 2.0
-    cp["resolution"] = [img_w, img_h]
-    return cp, {"출처": f"사양 프로파일 '{CALIB.ACTIVE_PROFILE}'",
-                "주의": "실측 캘리브레이션이 아니다. 사양표 값이므로 "
-                        "절대 거리에 계통 오차가 남을 수 있다"}
-
-
 def quantization_floor(rgb):
     """
     입력 이미지가 이진(안티에일리어싱 없음)인지 보고, 그렇다면 선 중심
@@ -608,20 +593,30 @@ def run(image, params=None, imu=None, truth=None, scene_image=None,
     """
     이미지 한 장을 끝까지 돌려 엑셀 조서 하나를 만든다.
 
-    두 갈래로 갈린다 — 가진 정보에 따라 정확도가 다르기 때문이다.
+    **규약에 맞는 촬영이 들어온다고 전제한다.** 이미지와
+    camera_params.json 은 필수이고, 그 값들이 실제로 그 이미지를 찍은
+    값이어야 한다. 들어오는 데이터가 규약을 만족하는지는 이 파이프라인이
+    아니라 앞단의 점검기가 답한다:
+
+        python3 hardware.py <촬영폴더>
+
+    사양 없이도 "돌아가게" 만들어 두면 초점거리·기선을 프로파일에서
+    가정하게 되고, 그러면 검측은 그대로 돌아가고 결과만 조용히 배율만큼
+    틀린다. 그 상태를 조서 각주로 알리는 것보다 **아예 받지 않는 편** 이
+    낫다 — 점검기가 무엇이 빠졌는지 그 자리에서 답한다.
+
+    두 갈래로 갈린다 — 정답값이 있으면 정확도까지 잰다.
 
       [정밀 경로]  사양 + 정답 3D + 장비 자세가 모두 있을 때.
                   발사각·기선 부호·카메라 자세를 데이터에서 복원하므로
                   가정이 거의 없다. 선검출 정확도와 깊이 오차를 mm 로 낸다.
-      [기본 경로]  이미지만, 또는 사양까지만 있을 때.
-                  발사각은 사양 프로파일의 이름값을 쓰고, 중력은 IMU 가
-                  없으면 똑바로 서 있다고 가정한다. 무엇을 가정했는지는
-                  조서 11번 시트에 그대로 적힌다.
+      [기본 경로]  사양까지만 있을 때. 중력은 IMU 가 없으면 똑바로 서
+                  있다고 가정하고, 그 사실을 조서 11번 시트에 적는다.
 
     Parameters
     ----------
     image : str            레이저 격자 이미지 (필수)
-    params : str | None    camera_params.json
+    params : str           camera_params.json (필수)
     imu : str | dict | None  IMU. 없으면 똑바로 서 있다고 가정
     truth : str | None     cast_pixels.json (정답 화소·3D)
     scene_image : str | None  레이저 OFF 장면 사진 (배경용)
@@ -632,6 +627,15 @@ def run(image, params=None, imu=None, truth=None, scene_image=None,
     -------
     dict — xlsx, result, detection, depth, images
     """
+    # 규약을 만족하지 않는 촬영은 그 자리에서 막는다. 사양 없이도
+    # "돌아가게" 두면 결과만 조용히 배율만큼 틀린다.
+    if not params:
+        raise ValueError(
+            "camera_params.json 이 필요하다 — 초점거리·기선·격자 사양을 "
+            "모르면 깊이가 통째로 배율만큼 틀린다.\n"
+            "  촬영이 규약을 만족하는지:  python3 hardware.py <촬영폴더>\n"
+            "  빈 서식 만들기:            python3 hardware.py --template")
+
     def say(*a):
         if verbose:
             print(*a)
@@ -858,10 +862,7 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
             truth_data = json.load(fp)
         say(f"  정답 데이터    {_os.path.basename(truth)} "
             f"— 선 {len(truth_data)}개")
-    if params:
-        cp, p_meta = _params_from_file(params, W, H)
-    else:
-        cp, p_meta = _params_from_profile(W, H)
+    cp, p_meta = _params_from_file(params, W, H)
     cp["standoff_z"] = float(standoff_m or 1.2)
     say(f"  카메라 사양   {p_meta['출처']}")
     say(f"    f={cp['f_px']:.1f}px  c=({cp['cx_px']:.1f},{cp['cy_px']:.1f})  "
@@ -986,9 +987,6 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
                              aux_lines_uv=tri.get("skipped_uv"))
     # 근거가 가정 위에 있으면 도장을 뺀다 (값은 그대로 남는다)
     _why = []
-    if not params:
-        _why.append("카메라 사양을 사양 프로파일에서 가정함 — 초점거리·기선·"
-                    "발사각이 실제와 다르면 깊이가 배율만큼 어긋난다")
     if g_assumed:
         _why.append("IMU 가 없어 장비가 똑바로 섰다고 가정함 — 숙여 찍었으면 "
                     "바닥이 기운 벽으로 읽힌다")
@@ -1395,12 +1393,6 @@ def _caveats(g_assumed, params, truth, qz, su, depth, backend):
                  "수직도·수평도는 면 법선과 중력의 사잇각이므로, 장비가 실제로 "
                  "기울어 있었다면 그 각도가 그대로 판정에 더해진다. 1° 기울면 "
                  "판정도 1° 틀린다 — 허용치가 ±0.5° 임을 생각하면 작지 않다.")
-    if not params:
-        c.append(f"카메라 사양을 실측 캘리브레이션이 아니라 사양 프로파일"
-                 f"('{CALIB.ACTIVE_PROFILE}')에서 가져왔다. 발사각 α_i·주점·"
-                 f"기선이 실제 장비와 다르면 절대 거리에 계통 오차가 남는다. "
-                 f"각도(수직도·수평도)는 상대량이라 영향이 작지만 평활도는 "
-                 f"거리 오차를 그대로 받는다.")
     if not truth:
         c.append("정답 데이터가 없어 선검출 정확도와 깊이 오차를 재지 못했다. "
                  "표의 σ_n 은 측정치가 아니라 가정에 따른 예상치다.")

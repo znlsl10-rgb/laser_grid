@@ -1266,6 +1266,65 @@ def test_hardware_contract():
         check("이미지가 없으면 막는다",
               not HW.check_capture(td, verbose=False)["ok"])
 
+    # ── 점검기의 핵심: 사양의 숫자가 이미지의 것인가 ──
+    # 파일이 다 있어도 사양이 다른 장비의 것이면 검측은 그대로 돌아가고
+    # 결과만 조용히 틀린다. 그 상태를 잡는지 본다.
+    import shutil as _sh
+    import tempfile as _td
+    _t = _td.mkdtemp()
+    try:
+        d = HW.demo(os.path.join(_t, "예제"), roll_deg=20.0, verbose=False)
+        r = HW.check_capture(d, verbose=False)
+        gi = r["기하"]
+        check(f"규약을 만족하는 촬영은 '검측 가능' "
+              f"(측정 f {gi.get('측정 초점거리_px')}px / 사양 "
+              f"{gi.get('사양 초점거리_px')}px)", r["쓸만함"])
+        check(f"굴림을 이미지에서 직접 잰다 "
+              f"({gi.get('측정 굴림_deg')}° vs 사양 {gi.get('사양 굴림_deg')}°)",
+              abs((gi.get("측정 굴림_deg") or 0) - 20.0) <= 2.0)
+
+        pj = os.path.join(d, "camera_params.json")
+        orig = json.load(open(pj, encoding="utf-8"))
+
+        def _mut(fn):
+            c = json.loads(json.dumps(orig))
+            fn(c)
+            json.dump(c, open(pj, "w", encoding="utf-8"))
+            out = HW.check_capture(d, verbose=False)
+            json.dump(orig, open(pj, "w", encoding="utf-8"))
+            return out
+
+        rr = _mut(lambda c: c["camera"].update(f_px=c["camera"]["f_px"] * 1.2))
+        check("초점거리를 20% 틀리게 적으면 잡는다 (선 간격은 거리와 무관)",
+              bool(rr["불일치"]) and not rr["쓸만함"])
+        rr = _mut(lambda c: c["laser"].update(roll_deg=0.0))
+        check("굴림을 틀리게 적으면 잡는다", bool(rr["불일치"]))
+        rr = _mut(lambda c: c["grid"].update(n_vertical=15))
+        check("선 수를 틀리게 적으면 잡는다", bool(rr["불일치"]))
+        rr = _mut(lambda c: c.update(baseline_m=c["baseline_m"] * 2))
+        check("실측 거리를 함께 주면 기선 오류도 잡는다", bool(rr["불일치"]))
+
+        # 기선은 사진 한 장으로는 검증할 수 없다 — b 와 Z 가 b/Z 로만
+        # 식에 들어오기 때문이다. 못 잡는 것이 정상이고, 그렇게 안내해야 한다.
+        rr = _mut(lambda c: (c.pop("측정거리_m", None),
+                             c.update(baseline_m=c["baseline_m"] * 2)))
+        check("실측 거리가 없으면 기선은 검증 못 한다고 안내한다",
+              not rr["불일치"]
+              and any("기선을 검증할 수 없다" in w for w in rr["경고"]))
+    finally:
+        _sh.rmtree(_t, ignore_errors=True)
+
+    # ── 파이프라인은 규약을 만족하는 촬영만 받는다 ──
+    try:
+        RP.run(image="/dev/null", params=None, verbose=False)
+        _got = ""
+    except ValueError as e:
+        _got = str(e)
+    except Exception as e:
+        _got = f"다른 예외: {e}"
+    check("사양 없이 파이프라인을 부르면 막고 점검기를 알려 준다",
+          "camera_params.json" in _got and "hardware.py" in _got)
+
     # ── 규약서·검사기·파서가 같은 자리를 보는가 ──
     # 이 셋이 어긋나면 업체가 값을 제대로 적어 놓고도 0 으로 돌아간다.
     # 굴림이 0 이면 가로선이 깊이를 못 주므로 결과가 통째로 달라진다.
@@ -1319,7 +1378,7 @@ def _colab_hint(HW):
     try:
         HW.colab()
     except RuntimeError as e:
-        return "폴더를 직접 지정" in str(e)
+        return "경로를 직접" in str(e)
     except Exception:
         return False
     return False

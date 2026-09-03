@@ -22,7 +22,8 @@ colab_run.py — 코랩에서 이 파일 하나만 돌리면 끝
 입력 (레이저 이미지만 필수)
 --------------------------
   레이저 격자 이미지   필수    아무 png/jpg
-  camera_params.json  선택    없으면 사양 프로파일 값
+  camera_params.json  **필수**  없으면 깊이가 배율만큼 틀린다
+                              (규약 확인:  python3 hardware.py <폴더>)
   cast_pixels.json    선택    있으면 선검출·깊이 오차를 대조
   IMU (json)          선택    없으면 장비가 똑바로 섰다고 가정
   장면 사진(레이저 OFF) 선택    없으면 레이저 이미지에서 선을 지워 배경으로
@@ -320,7 +321,7 @@ def find_inputs(dirs=None, image=None, verbose=True):
     if verbose:
         print("[입력]")
         for k, ko in (("image", "레이저 이미지 (필수)"),
-                      ("params", "카메라 사양"), ("truth", "정답값"),
+                      ("params", "카메라 사양(필수)"), ("truth", "정답값"),
                       ("imu", "IMU"), ("scene_image", "장면 사진(OFF)")):
             v = out[k]
             print(f"   {ko:<20} {os.path.basename(v) if v else '— 없음'}")
