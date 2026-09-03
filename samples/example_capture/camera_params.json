@@ -1,6 +1,6 @@
 {
   "camera": {
-    "f_px": 796.5,
+    "f_px": 942.3973578545247,
     "cx_px": 611.5,
     "cy_px": 511.5,
     "sensor_W": 1224,
@@ -8,12 +8,12 @@
   },
   "baseline_m": 0.15,
   "grid": {
-    "n_vertical": 15,
-    "n_horizontal": 15,
-    "fov_deg": 60.0
+    "n_vertical": 21,
+    "n_horizontal": 21,
+    "fov_deg": 45.23972989608086
   },
   "laser": {
-    "roll_deg": 20.0,
+    "roll_deg": 0.0,
     "tilt_deg": 0.0,
     "wavelength_nm": 520
   },

@@ -429,15 +429,34 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
 
     어떻게 푸는가
     ------------
-    격자를 예측 없이 읽는다(축 투영 + 임계). 그 다음 V선 위치 {u_j} 와
-    발사각 {α_j} 를 짝지어 Z 를 역산한다.
+    격자를 예측 없이 읽는다(축 투영 + 임계). 굴림 γ 를 되돌린 좌표
 
-        d_j = f·tan(α_j) + c_x − u_j = f·b/Z      →   Z = f·b / median(d_j)
+        u' = c_x + (u−c_x)·cos γ + (v−c_y)·sin γ
 
-    Z 가 물리적으로 말이 되고(0.4~8m) 선별 편차가 작으면 그 규약이 맞는
-    것이다. 정방향과 180° 반전 두 가지를 다 풀어 보고 잔차가 작은 쪽을
-    고른다. 시차 항이 부호를 가지므로 두 규약이 대칭이 아니고, 그래서
-    구분이 된다.
+    에서 V선의 예측 위치는
+
+        u'_i(Z) = f·tan(α_i) − f·b·cos γ / Z + c_x
+
+    이고, 여기서 미지수는 Z 하나뿐이다. 시차 항에 **cos γ 가 붙는다** —
+    법선 n=(cosα,0,−sinα) 를 광축 둘레로 γ 돌리면 n'=(cosα cosγ,
+    cosα sinγ, −sinα) 이고, n'·P=0 을 cosα 로 나누면
+    û cosγ + v̂ sinγ = tanα − (b/Z)·cosγ 가 되기 때문이다. 이 인수를
+    빼먹으면 Z 가 1/cos γ 배로 나온다(20° 에서 6.5% 과대, 실측: 1.50m
+    벽이 1.598m). 그래서 Z 를 훑으며 **읽은 선이
+    예측 선에 몇 개나 맞는지** 를 세고, 가장 많이 맞는 Z 를 고른 뒤 맞은
+    짝으로만 다시 푼다.
+
+    순서대로 짝지으면 안 된다
+    -----------------------
+    읽은 선을 정렬해 발사각과 순서대로 짝지으면, 앞에 선 부재가 선을
+    가리는 순간 무너진다. 가려진 선은 목록에서 빠지고 부재에 걸린 두 선은
+    한 덩어리로 뭉치므로 21개가 19개로 읽히고, 그러면 짝이 통째로 한 칸씩
+    밀려 Z 가 정확히 선 간격 하나만큼 틀린다(실측: 1.50m 벽이 1.08m 로
+    나왔고, 그 뒤 추적 밴드가 0.98~1.24m 로 잡혀 검측이 전멸했다).
+    개수를 맞출 필요가 없는 합의(consensus) 방식이라야 한다.
+
+    정방향과 180° 반전 두 가지를 다 풀어 맞은 개수가 많은 쪽을 고른다.
+    시차 항이 부호를 가지므로 두 규약이 대칭이 아니고, 그래서 구분이 된다.
 
     Returns
     -------
@@ -450,39 +469,54 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
         cx=cx, cy=cy)
     alphas = np.array(sorted(
         v["angle_rad"] for k, v in line_angles.items() if k.startswith("V")))
+    if len(u_img) < 5 or len(alphas) < 2:
+        return {"ok": False, "reason": "격자에서 거리를 풀지 못함",
+                "n_lines_read": int(len(u_img))}
+    base = f * np.tan(alphas) + cx                    # 시차를 뺀 예측 위치
+    # 굴림을 되돌린 좌표에서 시차는 f·b·cos γ / Z 다 (위 유도 참고)
+    fb = f * b * np.cos(np.radians(float(cp.get("laser_roll_deg", 0.0) or 0.0)))
+    # 맞았다고 볼 거리 — 이웃 선 간격의 1/4. 이보다 크면 옆 선에 맞는다.
+    tol = 0.25 * float(np.min(np.diff(np.sort(base))))
+    # 1/Z 를 균등히 훑는다. 시차가 1/Z 에 비례하므로 이쪽이 고른 격자다.
+    inv = np.linspace(1.0 / z_hi, 1.0 / z_lo, 1200)
+
     best = None
     for flipped in (False, True):
         u = np.sort(2 * cx - u_img if flipped else u_img)
-        if len(u) < 5:
-            continue
-        # 개수가 다를 수 있다(끝선이 화면 밖). 순서대로 겹치는 만큼만 본다.
-        n = min(len(u), len(alphas))
-        for off in range(0, max(1, len(alphas) - n + 1)):
-            a = alphas[off:off + n]
-            d = f * np.tan(a) + cx - u[:n]
-            if np.median(d) <= 0:
+        for iz in inv:
+            pred = base - fb * iz
+            d = np.abs(u[:, None] - pred[None, :])
+            near = d.min(axis=1)
+            hit = near <= tol
+            n_hit = int(hit.sum())
+            if n_hit < max(5, int(0.4 * len(u))):
                 continue
-            z = f * b / np.median(d)
+            # 맞은 짝으로만 Z 를 다시 푼다 (짝마다 f·b/Z 하나씩)
+            j = d[hit].argmin(axis=1)
+            dd = base[j] - u[hit]
+            if np.median(dd) <= 0:
+                continue
+            z = float(fb / np.median(dd))
             if not (z_lo <= z <= z_hi):
                 continue
-            zz = f * b / d[d > 0]
-            if len(zz) < 5:
-                continue
-            resid = float(np.std(zz))
-            cand = {"z_est_m": round(float(z), 4), "flipped": flipped,
-                    "resid_m": round(resid, 4), "n_matched": int(len(zz)),
-                    "offset": off}
-            if best is None or resid < best["resid_m"]:
-                best = cand
+            zz = fb / dd[dd > 0]
+            cand = {"z_est_m": round(z, 4), "flipped": flipped,
+                    "resid_m": round(float(np.std(zz)), 4),
+                    "n_matched": n_hit, "n_lines": int(len(u))}
+            # 많이 맞는 쪽이 먼저, 같으면 잔차가 작은 쪽
+            key = (n_hit, -cand["resid_m"])
+            if best is None or key > best[0]:
+                best = (key, cand)
     if best is None:
         return {"ok": False, "reason": "격자에서 거리를 풀지 못함",
                 "n_lines_read": int(len(u_img))}
-    best["ok"] = True
-    best["n_lines_read"] = int(len(u_img))
-    return best
+    out = best[1]
+    out["ok"] = True
+    out["n_lines_read"] = int(len(u_img))
+    return out
 
 
-def _depth_band(cp, line_angles, z_est, behind=1.15, safety=0.8):
+def _depth_band(cp, line_angles, z_est, behind=1.10, safety=0.8):
     """
     선검출 추적 밴드가 덮어야 할 깊이 구간 [z_near, z_far].
 

@@ -13,9 +13,26 @@
     "fov_deg": 45.23972989608086
   },
   "laser": {
-    "roll_deg": 0.0,
+    "roll_deg": 20.0,
     "tilt_deg": 0.0,
     "wavelength_nm": 520
+  },
+  "rig_transform": {
+    "laser_pos_world": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "camera_pos_world": [
+      0.15,
+      0.0,
+      0.0
+    ],
+    "camera_forward_world": [
+      0.0,
+      0.0,
+      1.0
+    ]
   },
   "sensor_size": [
     1224,

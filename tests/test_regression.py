@@ -1315,7 +1315,7 @@ def test_hardware_contract():
 
 
 def test_sample_capture():
-    """[21] 예제 입력 데이터셋 — 참값을 되찾는가"""
+    """[21] 예제 입력 데이터셋 — 격자 모양·거리 복원·참값 회수"""
     print("\n[21] 예제 입력 데이터셋 (make_sample_capture.py)")
     MK = _load("make_sample_capture")
     RP = _load("run_pipeline")
@@ -1324,6 +1324,7 @@ def test_sample_capture():
     import io as _io
     import contextlib
 
+    W, H = MK.W, MK.H
     on, off, Pmap, sid, planes = MK.render()
     check("[21] 렌더가 네 면을 모두 담는다",
           all((sid == k).sum() > 5000 for k in (0, 1, 2, 3)),
@@ -1331,47 +1332,95 @@ def test_sample_capture():
                     for k, n in ((0, "벽"), (1, "바닥"),
                                  (2, "동바리1"), (3, "동바리2"))))
 
-    W, H = MK.W, MK.H
-    cp = {"f_px": MK.F_PX, "cx_px": MK.CX, "cy_px": MK.CY, "b_m": MK.BASE_M,
-          "n_v": MK.N_V, "n_h": MK.N_H, "fov_h_deg": MK.FOV_DEG,
-          "fov_v_deg": MK.FOV_DEG, "laser_tilt_deg": MK.TILT_DEG,
-          "laser_roll_deg": MK.ROLL_DEG, "image_w": W, "image_h": H,
-          "resolution": [W, H], "standoff_z": 1.2}
+    # ── 격자가 유한한 사각형이어야 한다 ──
+    # 평면식만 쓰면 선이 화면 끝까지 이어져 21×21 칸이 어디서 끝나는지
+    # 보이지 않는다. 실제 DOE 는 유한한 부채꼴이다.
+    g = (on[:, :, 1].astype(float)
+         - 0.5 * (on[:, :, 0].astype(float) + on[:, :, 2].astype(float)))
+    ys, xs = np.nonzero(g > 40)
+    margin = min(xs.min(), W - 1 - xs.max(), ys.min(), H - 1 - ys.max())
+    check("[21] 격자가 화면 끝까지 이어지지 않는다 (유한한 부채꼴)",
+          margin > 30,
+          f"가장 좁은 여백 {margin}px  (u {xs.min()}~{xs.max()}, "
+          f"v {ys.min()}~{ys.max()})")
+    check("[21] 격자는 21×21 선",
+          MK.N_V == 21 and MK.N_H == 21, f"V{MK.N_V} × H{MK.N_H}")
+    size = 2.0 * MK.GRID_REF_Z * np.tan(np.radians(MK.FOV_DEG) / 2.0)
+    check("[21] 기준거리에서 격자 한 변이 규격대로",
+          abs(size - MK.GRID_SIZE_M) < 1e-6,
+          f"{MK.GRID_REF_Z:.2f}m 에서 {size:.3f}m × {size:.3f}m "
+          f"(칸 {size / (MK.N_V - 1) * 1000:.0f}mm)")
+    check("[21] 카메라 화각이 레이저 부채꼴보다 넓다 (그래야 격자가 안에 앉는다)",
+          MK.CAM_FOV_DEG > MK.FOV_DEG + 5.0,
+          f"카메라 {MK.CAM_FOV_DEG:.1f}° > 레이저 {MK.FOV_DEG:.2f}°")
+    check("[21] 반듯한 구성 — 굴림·수렴각 0",
+          MK.ROLL_DEG == 0.0 and MK.TILT_DEG == 0.0,
+          f"굴림 {MK.ROLL_DEG}° / 수렴각 {MK.TILT_DEG}°")
+
+    def _cp(roll):
+        return {"f_px": MK.F_PX, "cx_px": MK.CX, "cy_px": MK.CY,
+                "b_m": MK.BASE_M, "n_v": MK.N_V, "n_h": MK.N_H,
+                "fov_h_deg": MK.FOV_DEG, "fov_v_deg": MK.FOV_DEG,
+                "laser_tilt_deg": MK.TILT_DEG, "laser_roll_deg": roll,
+                "image_w": W, "image_h": H, "resolution": [W, H],
+                "standoff_z": 1.2}
+
+    # ── 거리 복원: 부재가 선을 가려도 흔들리지 않아야 한다 ──
+    # 읽은 선을 정렬해 순서대로 짝지으면 가려진 선 하나에 짝이 통째로
+    # 밀려 Z 가 선 간격 하나만큼 틀린다. 합의 방식이라야 한다.
+    cp = _cp(MK.ROLL_DEG)
     la = RP._line_angles(cp)
-
-    # ── 굴린 격자에서 거리 복원 ──
-    # 축 투영만 쓰면 20° 굴림에서 V선이 한 열도 못 채워 통째로 실패한다.
+    n_read = len(RP.read_grid_from_image(on)[0])
     pose = RP.estimate_grid_pose(on, cp, la)
-    check("[21] 굴린 격자에서도 거리를 푼다",
-          bool(pose.get("ok")) and abs(pose["z_est_m"] - 2.5) < 0.35,
-          f"Z={pose.get('z_est_m')} m (벽 참값 2.50 m), 선 {pose.get('n_matched')}개")
-    check("[21] 굴림을 무시하면 격자를 못 읽는다 (이 보정이 필요한 이유)",
-          len(RP.read_grid_from_image(on)[0]) < 5,
-          f"굴림 미보정 시 읽은 V선 {len(RP.read_grid_from_image(on)[0])}개 "
-          f"/ 보정 시 {len(RP.read_grid_from_image(on, roll_rad=np.radians(MK.ROLL_DEG), cx=MK.CX, cy=MK.CY)[0])}개")
+    z_true = float(MK.WALL_P0[2])
+    check("[21] 부재가 선을 가려도 거리를 정확히 푼다 (합의 방식)",
+          bool(pose.get("ok")) and abs(pose["z_est_m"] - z_true) < 0.02,
+          f"Z={pose.get('z_est_m')} m (벽 참값 {z_true:.2f} m) — "
+          f"읽은 선 {n_read}/{MK.N_V}개, 맞은 선 {pose.get('n_matched')}개")
+    check("[21] 실제로 선이 가려져 개수가 모자란 상황이다 (이 검증이 뜻을 가지려면)",
+          n_read < MK.N_V, f"읽은 선 {n_read} < 발사한 선 {MK.N_V}")
 
-    # ── 추적 깊이 구간이 배경 **앞** 으로 열려야 한다 ──
+    # ── 굴린 구성: 축 투영만으로는 격자를 못 읽는다 ──
+    on_r, _, _, _, pl_r = MK.render(roll_deg=20.0)
+    cp_r = _cp(20.0)
+    la_r = RP._line_angles(cp_r)
+    n_plain = len(RP.read_grid_from_image(on_r)[0])
+    n_roll = len(RP.read_grid_from_image(
+        on_r, roll_rad=np.radians(20.0), cx=MK.CX, cy=MK.CY)[0])
+    check("[21] 굴린 격자는 굴림 보정을 해야 읽힌다",
+          n_plain < 5 <= n_roll,
+          f"굴림 미보정 {n_plain}개 → 보정 {n_roll}개")
+    pose_r = RP.estimate_grid_pose(on_r, cp_r, la_r)
+    check("[21] 굴린 격자에서도 거리를 푼다",
+          bool(pose_r.get("ok")) and abs(pose_r["z_est_m"] - z_true) < 0.06,
+          f"Z={pose_r.get('z_est_m')} m (참값 {z_true:.2f} m)")
+
+    # ── 추적 밴드가 배경 **앞** 의 부재를 덮어야 한다 ──
     band = RP._depth_band(cp, la, pose["z_est_m"])
+    front = min(p["xz"][1] - p["r"] for p in MK.POSTS)
     check("[21] 깊이 구간이 배경 앞의 부재까지 덮는다",
-          band[0] < min(p["xz"][1] for p in MK.POSTS) < band[1],
-          f"구간 {band[0]:.2f}~{band[1]:.2f} m, 동바리 "
-          + "/".join(f"{p['xz'][1]:.2f}" for p in MK.POSTS) + " m")
+          band[0] < front and band[1] > z_true,
+          f"구간 {band[0]:.2f}~{band[1]:.2f} m, 동바리 앞면 {front:.3f} m, "
+          f"벽 {z_true:.2f} m")
     cp["standoff_z"], cp["z_range"] = pose["z_est_m"], band
 
     buf = _io.StringIO()
     with contextlib.redirect_stdout(buf):
         det = DET.detect(on, {}, la, cp, multi_surface=True)
     cam = np.array([MK.BASE_M, 0.0, 0.0])
-    n_post = 0
-    for lid, uv in det.items():
-        uv = np.asarray(uv, float)
-        if not len(uv):
-            continue
+
+    def _hit(uv):
         D = np.stack([(uv[:, 0] - MK.CX) / MK.F_PX,
                       (uv[:, 1] - MK.CY) / MK.F_PX, np.ones(len(uv))], axis=1)
         D /= np.linalg.norm(D, axis=1, keepdims=True)
-        _, _, s2 = MK.trace(cam, D)
-        n_post += int(((s2 == 2) | (s2 == 3)).sum())
+        return MK.trace(cam, D)
+
+    n_post = 0
+    for uv in det.values():
+        uv = np.asarray(uv, float)
+        if len(uv):
+            _, _, s2 = _hit(uv)
+            n_post += int(((s2 == 2) | (s2 == 3)).sum())
     # 매끄러움 컷이 부재를 지우면 여기가 100점대로 떨어진다
     check("[21] 배경 앞 부재의 화소가 살아남는다 (매끄러움 컷에 지워지지 않음)",
           n_post > 900, f"동바리 검출 점 {n_post}개")
@@ -1380,25 +1429,25 @@ def test_sample_capture():
     err = []
     for lid in lx:
         uv = np.asarray(luv[lid], float)
-        D = np.stack([(uv[:, 0] - MK.CX) / MK.F_PX,
-                      (uv[:, 1] - MK.CY) / MK.F_PX, np.ones(len(uv))], axis=1)
-        D /= np.linalg.norm(D, axis=1, keepdims=True)
-        Pt, _, _ = MK.trace(cam, D)
+        Pt, _, _ = _hit(uv)
         m = np.isfinite(Pt[:, 2])
         err.append((np.asarray(lx[lid], float)[m, 2] - Pt[m, 2]) * 1000.0)
     e = np.concatenate(err)
     bias = float(np.median(e))
     mad = 1.4826 * float(np.median(np.abs(e - bias)))
-    # 화소 중심 규약이 0.5px 어긋나면 여기가 30mm 대로 뛴다
+    # 화소 중심 규약이 0.5px 어긋나면 여기가 수십 mm 로 뛴다
     check("[21] 깊이에 계통 오차가 없다 (화소 중심 규약 일치)",
-          abs(bias) < 5.0, f"치우침 {bias:+.2f}mm / 산포(MAD) {mad:.2f}mm")
+          abs(bias) < 3.0, f"치우침 {bias:+.2f}mm / 산포(MAD) {mad:.2f}mm")
 
-    # ── 규약 검사기 + 참값 대조 ──
-    root = os.path.join(ROOT, "samples", "example_capture")
-    if os.path.isdir(root):
-        HW = _load("hardware")
-        r = HW.check_capture(root, verbose=False)
-        check("[21] 예제 폴더가 규약 검사를 통과한다", bool(r["ok"]),
+    # ── 폴더가 실제로 규약을 통과하고 참값을 되찾는가 ──
+    HW = _load("hardware")
+    root = os.path.join(ROOT, "samples")
+    for name in ("example_capture", "minimal_capture", "rolled_capture"):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        r = HW.check_capture(d, verbose=False)
+        check(f"[21] samples/{name} 가 규약 검사를 통과한다", bool(r["ok"]),
               f"막힘 {len(r['필수문제'])}건 / 경고 {len(r['경고'])}건")
 
 

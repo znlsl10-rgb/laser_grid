@@ -197,7 +197,20 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
         sub = gidx[ax["inlier_mask"]]
         if len(sub) < min_linear_points:
             continue
-        if _EQ5.geometric_evidence(pts[sub], g_hat)["shape"] != "linear_vertical":
+        ev0 = _EQ5.geometric_evidence(pts[sub], g_hat)
+        # 격자를 굴리지 않으면 연직 부재에는 세로선이 **한 줄** 만 걸리고,
+        # 그 점들은 두께가 0 인 직선이 된다 — 단면이 잡히지 않아 형상은
+        # linear_vertical 이 아니라 degenerate_line 이다. 그것도 여기서
+        # 걷어내야 한다. 안 그러면 평면 단계가 두 동바리를 한 장의 벽으로
+        # 묶어 둘 다 잃는다(실측: 1.27m·1.33m 동바리 1,155점이 "벽
+        # 수직도 0.20° 합격" 으로 나왔다).
+        if ev0["shape"] == "linear_vertical":
+            undecided = True          # 형상이 이미 얇은 부재라고 말한다
+        elif (ev0["shape"] == "degenerate_line"
+              and ev0.get("theta_deg") is not None
+              and ev0["theta_deg"] < 30.0):
+            undecided = False         # 형상이 아무 말도 못 한다 → 깊이가 결정
+        else:
             continue
         # 형상이 "선" 이라는 것만으로는 부재가 아니다 — 벽에 그은 레이저
         # 선 한 줄도 3D 에서는 선이다. 벽 위 이웃 V선 간격(2.5m 에서
@@ -205,7 +218,7 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
         # 도막이 제 군집이 되어 여기로 올라온다. 가릴 수 있는 것은
         # 깊이뿐이므로 주변보다 앞에 서 있는지 함께 본다.
         if not _stands_in_front(pts, sub, g_hat, occluder_margin_m,
-                                undecided=True):
+                                undecided=undecided):
             continue
         labels[sub] = next_id
         # 기하는 동바리/기둥/철근을 구분하지 못한다 → 가장 흔한 shoring
@@ -241,6 +254,11 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
             ev = _EQ5.geometric_evidence(pts[gidx], g_hat)
             cls = {"plane_vertical": "wall",
                    "plane_horizontal": "floor"}.get(ev["shape"])
+            if (cls is not None and _is_narrow_strip(ev)
+                    and _stands_in_front(pts, gidx, g_hat, occluder_margin_m)):
+                # 평면으로 맞기는 하지만 벽이라 부를 폭이 아니고, 게다가
+                # 주변보다 앞에 서 있다 → 면이 아니라 부재다.
+                cls = "shoring"
             if cls is None:
                 # 평면으로 확정되지 않은 덩어리(얇은 원통 등)는 라벨을 붙이지
                 # 않고 선형 단계로 넘긴다. 평면 후보에서는 빼야 다음 회차가
@@ -285,6 +303,13 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
             labels[gidx] = next_id
             # 기하는 동바리/기둥/철근을 구분하지 못한다 → 가장 흔한 shoring 으로
             # 두되, meta 에 구분 불가임을 남긴다.
+            class_names[next_id] = "shoring"
+            next_id += 1
+        elif (ev["shape"] in ("plane_vertical", "plane_horizontal")
+              and _is_narrow_strip(ev)
+              and _stands_in_front(pts, gidx, g_hat, occluder_margin_m)):
+            # 평면 단계에서 넘어온 가느다란 조각 — 위와 같은 이유로 부재다
+            labels[gidx] = next_id
             class_names[next_id] = "shoring"
             next_id += 1
         elif (ev["shape"] == "degenerate_line"
@@ -448,6 +473,27 @@ def _merge_occlusion_split(all_points, member_idx, groups, plane, merge_gap_m,
     for i, g in enumerate(groups):
         merged.setdefault(find(i), []).append(g)
     return [np.concatenate(v) if len(v) > 1 else v[0] for v in merged.values()]
+
+
+def _is_narrow_strip(ev, max_extent2_m=0.10, max_r21=0.20):
+    """
+    "면" 으로 부르기엔 너무 좁고 긴 덩어리인가.
+
+    격자를 굴리지 않으면 연직 동바리에는 세로선이 한두 줄만 걸리고, 그
+    점들은 나란한 직선 한둘이 된다. 나란한 직선 둘을 지나는 평면은 잘
+    정해지므로 평면 적합 자체는 성공하고, 형상 판정도 plane_vertical 이
+    나온다. 그러면 폭 40mm 짜리 동바리가 조서에 **벽** 으로 실린다.
+
+    기하가 틀린 것이 아니라 이름이 틀린 것이다. 그래서 평면인지 여부가
+    아니라 "이만한 폭을 벽이라 부를 수 있는가" 로 가른다. 판정은 깊이가
+    마무리한다 — 좁고 길면서 주변보다 앞에 서 있으면 부재다.
+    """
+    eig = ev.get("eig")
+    if not eig or len(eig) < 2 or eig[0] <= 1e-18:
+        return False
+    r21 = eig[1] / eig[0]
+    ext2 = float(np.sqrt(max(eig[1], 0.0)))
+    return r21 < float(max_r21) and ext2 < float(max_extent2_m)
 
 
 def _merge_vertical_fragments(points, groups, g_hat, gap_m=0.12):
