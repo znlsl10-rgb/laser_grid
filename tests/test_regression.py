@@ -1314,6 +1314,17 @@ def test_hardware_contract():
           and abs(lan["V0"]["depth_gain"] - 1.0) < 1e-9)
 
 
+def _colab_hint(HW):
+    """코랩 밖에서 hardware.colab() 을 부르면 안내를 주는가."""
+    try:
+        HW.colab()
+    except RuntimeError as e:
+        return "폴더를 직접 지정" in str(e)
+    except Exception:
+        return False
+    return False
+
+
 def test_sample_capture():
     """[21] 예제 입력 데이터셋 — 격자 모양·거리 복원·참값 회수"""
     print("\n[21] 예제 입력 데이터셋 (make_sample_capture.py)")
@@ -1438,6 +1449,42 @@ def test_sample_capture():
     # 화소 중심 규약이 0.5px 어긋나면 여기가 수십 mm 로 뛴다
     check("[21] 깊이에 계통 오차가 없다 (화소 중심 규약 일치)",
           abs(bias) < 3.0, f"치우침 {bias:+.2f}mm / 산포(MAD) {mad:.2f}mm")
+
+    # ── 코랩 진입점 ──
+    # 코랩은 폴더를 통째로 못 올린다. zip 한 겹과 낱개 업로드 두 경우 모두
+    # 촬영 폴더를 찾아내야 한다.
+    HW = _load("hardware")
+    import tempfile
+    import zipfile
+    import shutil
+    src = os.path.join(ROOT, "samples", "example_capture")
+    if os.path.isdir(src):
+        td = tempfile.mkdtemp()
+        try:
+            zp = os.path.join(td, "촬영.zip")
+            with zipfile.ZipFile(zp, "w") as zf:
+                for f in os.listdir(src):
+                    zf.write(os.path.join(src, f), f"내촬영_2026/{f}")
+                zf.writestr("__MACOSX/._laser_on.png", b"junk")   # 맥 압축 부산물
+            ex = os.path.join(td, "ex")
+            with zipfile.ZipFile(zp) as zf:
+                zf.extractall(ex)
+            root = HW._find_capture_dir(ex)
+            check("[21] zip 한 겹 안의 촬영 폴더를 찾는다",
+                  os.path.basename(root) == "내촬영_2026"
+                  and HW.check_capture(root, verbose=False)["ok"],
+                  f"찾은 폴더 {os.path.basename(root)}")
+            flat = os.path.join(td, "flat")
+            os.makedirs(flat)
+            for f in ("laser_on.png", "camera_params.json"):
+                shutil.copy(os.path.join(src, f), flat)
+            check("[21] 낱개로 올린 파일도 한 촬영 폴더로 본다",
+                  HW._find_capture_dir(flat) == flat
+                  and HW.check_capture(flat, verbose=False)["ok"])
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+    check("[21] 코랩이 아니면 무엇을 하라는지 알려 준다",
+          _colab_hint(HW), "폴더를 직접 지정하라는 안내")
 
     # ── 폴더가 실제로 규약을 통과하고 참값을 되찾는가 ──
     HW = _load("hardware")

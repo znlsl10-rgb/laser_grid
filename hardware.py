@@ -109,6 +109,100 @@ IMG_ON = ("laser_on", "cast", "_on", "on_", "grid", "레이저")
 IMG_OFF = ("laser_off", "cam", "scene", "_off", "off_", "배경", "장면")
 
 
+IMG_EXT = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+
+
+# =====================================================================
+# 코랩
+# =====================================================================
+def _find_capture_dir(root):
+    """
+    풀어 놓은 폴더 안에서 **촬영 폴더** 를 찾는다.
+
+    zip 은 보통 한 겹 더 싸여 있고(`촬영/laser_on.png`), 맥에서 압축하면
+    `__MACOSX` 같은 부산물이 섞인다. 이미지가 들어 있는 가장 얕은 폴더를
+    촬영 폴더로 본다.
+    """
+    best = None
+    for dirpath, dirnames, filenames in _os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(("__MACOSX", ".", "_"))]
+        if any(f.lower().endswith(IMG_EXT) for f in filenames):
+            depth = dirpath[len(root):].count(_os.sep)
+            if best is None or depth < best[0]:
+                best = (depth, dirpath)
+    return best[1] if best else root
+
+
+def colab(folder=None, verbose=True):
+    """
+    코랩에서 한 줄로 촬영 한 벌을 점검한다.
+
+        import hardware
+        hardware.colab()                          # 업로드 창을 띄운다
+        hardware.colab("samples/example_capture") # 예제로 먼저 확인
+
+    코랩의 업로드는 **파일 단위** 라 폴더를 통째로 올릴 수 없다. 그래서
+    두 가지를 다 받는다.
+
+      · zip 하나        — 풀어서 그 안의 촬영 폴더를 찾는다
+      · 파일 여러 개    — laser_on.png, camera_params.json … 을 한꺼번에
+                          골라 올리면 그것들이 한 촬영 폴더가 된다
+
+    올린 파일은 작업 폴더를 어지럽히지 않도록 임시 폴더에 따로 푼다.
+    """
+    if folder:
+        return check_capture(folder, verbose=verbose)
+
+    try:
+        from google.colab import files            # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "코랩이 아니다. 폴더를 직접 지정할 것: "
+            "hardware.colab('촬영폴더')  또는  python3 hardware.py 촬영폴더")
+
+    import shutil
+    import tempfile
+    import zipfile
+
+    print("촬영 한 벌을 올리세요 — zip 하나, 또는 파일 여러 개를 한꺼번에.")
+    print("  필수: laser_on.png, camera_params.json")
+    print("  권장: laser_off.png, imu.json      선택: truth.json")
+    up = files.upload()
+    if not up:
+        print("올린 파일이 없다.")
+        return None
+
+    tmp = tempfile.mkdtemp(prefix="capture_")
+    for name, data in up.items():
+        dst = _os.path.join(tmp, _os.path.basename(name))
+        with open(dst, "wb") as fp:
+            fp.write(data)
+        # 코랩 업로드는 작업 폴더에도 같은 파일을 남긴다 — 치운다
+        if _os.path.exists(name) and _os.path.abspath(name) != _os.path.abspath(dst):
+            try:
+                _os.remove(name)
+            except OSError:
+                pass
+
+    for name in list(up):
+        z = _os.path.join(tmp, _os.path.basename(name))
+        if z.lower().endswith(".zip"):
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(tmp)
+            _os.remove(z)
+
+    root = _find_capture_dir(tmp)
+    print(f"\n촬영 폴더: {root}")
+    print("  " + ", ".join(sorted(_os.listdir(root))))
+    res = check_capture(root, verbose=verbose)
+    res["_tmp"] = tmp
+    print("\n다음 단계:  from run_pipeline import run"
+          f"\n            run(image='{root}/laser_on.png',"
+          f"\n                params='{root}/camera_params.json', out='조서.xlsx')")
+    return res
+
+
 def _dig(d, path):
     cur = d
     for k in path.split("."):
@@ -218,7 +312,10 @@ def check_image(path):
         out["채널 대비"] = meta.get("why")
     except Exception as e:
         sig = a[:, :, 1] - 0.5 * (a[:, :, 0] + a[:, :, 2])
-        out["레이저 채널"] = f"판별 실패({e}) — 초록 가정"
+        out["레이저 채널"] = (
+            f"판별 실패({e}) — 초록 가정. hardware.py 만 따로 두면 "
+            f"laser_signal.py 를 못 찾는다. 저장소를 통째로 받을 것: "
+            f"git clone https://github.com/znlsl10-rgb/laser_grid.git")
 
     hi = float(np.percentile(sig, 99.9))
     med = float(np.median(sig))
@@ -253,9 +350,7 @@ def check_capture(folder, verbose=True):
         return res
 
     names = sorted(_os.listdir(folder))
-    imgs = [n for n in names
-            if n.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff",
-                                   ".bmp"))]
+    imgs = [n for n in names if n.lower().endswith(IMG_EXT)]
     jsons = [n for n in names if n.lower().endswith(".json")]
 
     on = next((n for n in imgs
