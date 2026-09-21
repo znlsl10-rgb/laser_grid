@@ -1332,8 +1332,12 @@ def test_hardware_contract():
         # 그 소스가 실제로 도는가
         import subprocess
         open(os.path.join(_t2, "hardware.py"), "w", encoding="utf-8").write(body)
+        # 점검기는 리다이렉트될 때 UTF-8 로 쓴다(_console_utf8). 부모가
+        # text=True 로 로케일(cp949) 디코딩을 하면 읽기 스레드가 죽고
+        # stdout 이 None 으로 온다 — 인코딩을 명시한다.
         r = subprocess.run([sys.executable, "hardware.py", "--demo"],
-                           cwd=_t2, capture_output=True, text=True)
+                           cwd=_t2, capture_output=True,
+                           encoding="utf-8", errors="replace")
         check("노트북에서 꺼낸 소스가 그대로 돈다",
               r.returncode == 0 and "검측 가능" in r.stdout)
     finally:
@@ -1383,12 +1387,21 @@ def test_hardware_contract():
               abs(cp["laser_roll_deg"] - 20.0) < 1e-9
               and abs(cp["laser_tilt_deg"] - 6.0) < 1e-9
               and np.isfinite(gh))
+    # 안 적었을 때의 기본값은 **활성 프로파일** 이다. 예전 이 검증은 0 을
+    # 기대했는데, 그것은 활성 프로파일이 굴림 0° 이던 시절의 값이었다.
+    # 시제품 프로파일(unisj_proto, 굴림 38°)로 바뀐 뒤로는 맞지 않는다.
+    # 값을 안 적은 촬영에 프로파일 굴림이 들어가는 것이 위험하지 않은 이유는
+    # hardware.py 가 굴림을 **이미지에서 직접 재서** 사양과 대조하기 때문이다
+    # (위 [20] 「굴림을 이미지에서 직접 잰다」).
     cp0, _m0, la0 = _parse({})
-    check("안 적으면 0 으로 두고 가로선 이득은 무한(깊이 못 줌)",
-          cp0["laser_roll_deg"] == 0.0
-          and not np.isfinite(float(np.median(
-              [v["depth_gain"] for k, v in la0.items()
-               if k.startswith("H")]))))
+    gh0 = float(np.median([v["depth_gain"] for k, v in la0.items()
+                           if k.startswith("H")]))
+    check(f"안 적으면 활성 프로파일 값으로 둔다 "
+          f"(굴림 {cp0['laser_roll_deg']:.1f}°, 수렴각 "
+          f"{cp0['laser_tilt_deg']:.2f}°, H선 이득 {gh0:.2f})",
+          cp0["laser_roll_deg"] == CALIB.LASER_ROLL_DEG
+          and cp0["laser_tilt_deg"] == CALIB.LASER_TILT_DEG
+          and (np.isfinite(gh0) if CALIB.LASER_ROLL_DEG else not np.isfinite(gh0)))
 
     cpn, mn, lan = _parse({"lines": {"V0": {"normal": [3.0, 0.0, 4.0]}}})
     check(f"선별 평면 법선을 직접 주면 그대로 쓴다 "
@@ -1582,7 +1595,31 @@ def test_sample_capture():
               f"막힘 {len(r['필수문제'])}건 / 경고 {len(r['경고'])}건")
 
 
+def _console_utf8():
+    """cp949 콘솔·리다이렉트에서 '—' 한 글자에 죽지 않게 한다.
+
+    회귀 검증을 파일로 받아 두는 것은 당연한 일인데(`python
+    tests/test_regression.py > 결과.txt`), 로케일 인코딩이 걸려 마지막
+    줄에서 UnicodeEncodeError 로 끝나 버렸다. hardware.py 와 같은 처방이다.
+    """
+    probe = "— · → ±°σ"
+    for st in (sys.stdout, sys.stderr):
+        try:
+            probe.encode(getattr(st, "encoding", None) or "ascii")
+            continue
+        except Exception:
+            pass
+        for kw in ({"encoding": "utf-8"}, {"errors": "replace"}):
+            try:
+                st.reconfigure(**kw)
+                probe.encode(getattr(st, "encoding", None) or "utf-8")
+                break
+            except Exception:
+                continue
+
+
 def main():
+    _console_utf8()
     print("=" * 70)
     print("레이저 그리드 품질검측 — 회귀 검증")
     print("=" * 70)
