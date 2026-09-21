@@ -403,8 +403,18 @@ def _fan_angles(n, fov_deg, model=None):
         return np.arcsin(np.sin(half) * t)
     if model == "equal_angle":
         return half * t
+    # [2026-09-21 실데이터 검증] equal_tan 은 **0차 도트 위를 선 하나가
+    # 지나간다.** 회절되지 않은 0차 광선이 k=0 선이기 때문이다. 그래서
+    # 선은 tan 공간에서 k·pitch (k = −n/2 … n/2−1) 에 놓인다. 예전에는
+    # ±fov/2 를 균등분할해 짝수 n 에서 축이 두 선 **사이** 로 떨어졌고,
+    # 그러면 격자 전체가 반 간격(실측 ≈65px) 밀린다. 그 상태로는 이미지의
+    # 선과 예측이 참 거리에서 0/8 만 맞고, 엉뚜한 거리에서 8/8 로 맞아
+    # 1.359m 벽이 0.714m 로 복원됐다 (04_실촬영 3벌 모두 재현).
+    # 바꾼 뒤 세 벌 모두 도트 거리에서 8/8·9/9·9/9 로 맞는다.
     if model == "equal_tan":
-        return np.arctan(np.tan(half) * t)
+        pitch = 2.0 * np.tan(half) / (int(n) - 1)
+        k = np.arange(-(int(n) // 2), int(n) - (int(n) // 2))
+        return np.arctan(k * pitch)
     raise ValueError(f"알 수 없는 DOE 모델: {model}")
 
 

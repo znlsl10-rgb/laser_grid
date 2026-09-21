@@ -294,8 +294,18 @@ def fan_angles(n, fov_deg, model="equal_angle"):
     t = np.linspace(-1.0, 1.0, int(n))
     if model == "equal_sine":
         return np.arcsin(_math.sin(half) * t)
+    # [2026-09-21 실데이터 검증] equal_tan 은 **0차 도트 위를 선 하나가
+    # 지나간다.** 회절되지 않은 0차 광선이 k=0 선이기 때문이다. 그래서
+    # 선은 tan 공간에서 k·pitch (k = −n/2 … n/2−1) 에 놓인다. 예전에는
+    # ±fov/2 를 균등분할해 짝수 n 에서 축이 두 선 **사이** 로 떨어졌고,
+    # 그러면 격자 전체가 반 간격(실측 ≈65px) 밀린다. 그 상태로는 이미지의
+    # 선과 예측이 참 거리에서 0/8 만 맞고, 엉뚜한 거리에서 8/8 로 맞아
+    # 1.359m 벽이 0.714m 로 복원됐다 (04_실촬영 3벌 모두 재현).
+    # 바꾼 뒤 세 벌 모두 도트 거리에서 8/8·9/9·9/9 로 맞는다.
     if model == "equal_tan":
-        return np.arctan(_math.tan(half) * t)
+        pitch = 2.0 * _math.tan(half) / (int(n) - 1)
+        k = np.arange(-(int(n) // 2), int(n) - (int(n) // 2))
+        return np.arctan(k * pitch)
     return half * t
 
 
@@ -1500,7 +1510,34 @@ zip 안에 촬영 폴더가 여럿이면 각각 따로 점검하고 끝에 요�
 # =====================================================================
 # CLI
 # =====================================================================
+
+
+def _console_utf8():
+    """윈도우 기본 인코딩(cp949)은 ‘—’ 한 글자에 UnicodeEncodeError 로 죽는다.
+
+    콘솔로 바로 찍을 때는 파이썬이 유니코드로 써 주지만, **파일로 리다이렉트**
+    하면(`python hardware.py … > 점검.txt`) 로케일 인코딩이 걸려 그 자리에서
+    멈췔 버린다. 현장에서 점검 기록을 파일로 남기는 것은 당연한 일이므로,
+    이 문서가 쓰는 글자를 감당 못 하는 인코딩이면 UTF-8 로 바꿈다.
+    """
+    probe = "— · → ±°σ"
+    for st in (_sys.stdout, _sys.stderr):
+        try:
+            probe.encode(getattr(st, "encoding", None) or "ascii")
+            continue                      # 그대로 써도 된다
+        except Exception:
+            pass
+        for kw in ({"encoding": "utf-8"}, {"errors": "replace"}):
+            try:
+                st.reconfigure(**kw)
+                probe.encode(getattr(st, "encoding", None) or "utf-8")
+                break
+            except Exception:
+                continue
+
+
 def main(argv=None):
+    _console_utf8()
     a = list(_sys.argv[1:] if argv is None else argv)
     if a and a[0] == "--template":
         out = a[1] if len(a) > 1 else "camera_params.json"

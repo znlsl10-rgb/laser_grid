@@ -316,14 +316,18 @@ def _sheet_design(wb, openpyxl):
         ("선검출 픽셀오차", "σ_u", f"{CALIB.SIGMA_U_PX} px", "sigma_u"),
     ]
     from openpyxl.styles import PatternFill, Font
-    grade_fill = {"spec": ("DCFCE7", "166534"),
+    # 등급 색. measured 는 시제품 프로파일에서 쓴다 — 실측이라 spec 보다
+    # 강하다. 모르는 등급이 와도 조서는 나와야 하므로 회색으로 떨어뜨린다
+    # (색이 없다고 조서를 통째로 못 내면 곤란하다).
+    grade_fill = {"measured": ("D1FAE5", "065F46"),
+                  "spec": ("DCFCE7", "166534"),
                   "design": ("DBEAFE", "1E40AF"),
                   "assumed": ("FEF9C3", "854D0E")}
     for name, sym, val, key in rows:
         grade, note = prov[key]
         ws.append([name, sym, val, grade, note])
         c = ws.cell(row=ws.max_row, column=4)
-        bg, fg = grade_fill[grade]
+        bg, fg = grade_fill.get(grade, ("F3F4F6", "374151"))
         c.fill = PatternFill("solid", fgColor=bg)
         c.font = Font(bold=True, color=fg, size=10)
 

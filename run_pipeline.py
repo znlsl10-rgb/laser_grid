@@ -56,6 +56,7 @@ run_pipeline.py — 이미지 한 장 → 엑셀 조서 한 개
 import argparse
 import json
 import os as _os
+import sys as _sys
 import importlib.util as _ilu
 import numpy as np
 
@@ -205,6 +206,11 @@ def _params_from_file(path, img_w, img_h):
               _dig(d, "laser.roll_deg"), grid.get("laser_roll_deg"),
               d.get("laser_roll_deg"), CALIB.LASER_ROLL_DEG))}
     cp["sensor_w"], cp["sensor_h"] = float(sensor[0]), float(sensor[1])
+    # 렌즈 왜곡계수 [k1,k2,p1,p2,k3]. 있으면 삼각측량 전에 되돌린다.
+    dc = _first(cam.get("dist_coeffs"), d.get("dist_coeffs"))
+    cp["dist_coeffs"] = ([float(x) / 1.0 for x in dc]
+                         if isinstance(dc, (list, tuple)) and len(dc) >= 4
+                         else [])
     # 선별 레이저 평면 법선을 직접 쟀다면 각도 모델보다 그쪽이 정확하다.
     # 평면 하나에 자유도 3 이라 굴림·수렴각·왜곡이 그 안에 다 흡수된다.
     lines = d.get("lines")
@@ -399,6 +405,85 @@ def read_grid_from_image(rgb, occupancy=0.35, roll_rad=0.0, cx=None, cy=None):
             _occupancy_peaks(vp, lit, occupancy))
 
 
+def _zero_order_dot_u(rgb, cp):
+    """0차 도트의 **굴림 되돌린 가로 위치** u' [px] — 못 찾으면 None.
+
+    왜 필요한가 — 격자만으로는 거리가 한 개로 안 정해진다
+    --------------------------------------------------
+    읽은 선은 간격이 거의 일정한 **빗살** 이다. 예측 빗살을 한 칸 밀어도
+    같은 수만큼 맞으므로, 시차가 선 간격 하나만큼 바뀐 거리가 똑같이
+    "다 맞는" 답이 된다(실측: 1.359m 벽이 0.714m·0.791m 에서도 8/8 로
+    맞았다). 화면 밖으로 나간 선이 많을수록 — 실촬영 3벌은 20선 중 8~9선만
+    보였다 — 이 암묵이 깊다.
+
+    0차 도트는 회절되지 않은 광선이라 **한 점** 이다. 번호를 매길 필요가
+    없으므로 암묵이 없고, 그 자리가 곧 시차다:
+
+        u'_dot = c_x − f·b·cosγ / Z + f·tanδ
+
+    수렴각 δ 를 빼지 않으면 그 몫이 시차로 읽혀 거리가 배로 틀어진다
+    (실측: δ 3.11° 를 0 으로 적은 사양으로 1.36m 가 2.50m 로 나왔다).
+
+    시차는 부호를 가지므로 도트는 **화소 규약** 도 같이 정한다. 정방향이면
+    도트가 주점보다 왼쪽(시차 > 0)에, 180° 뒤집힌 내보내기면 오른쪽에 온다.
+    거리를 도트로 좁히고도 규약을 개수로만 고르면 뒤집힌 쪽이 이겨 버렸다
+    (실측 capture_001: 뒤집힘으로 뽑혀 깊이 중앙이 0.91m 로 나왔다).
+    그래서 u' 만 돌려주고, 규약별 시차는 부르는 쪽에서 따진다.
+    """
+    try:
+        HW = _load("hardware")                  # numpy·Pillow 만 쓴다
+        dot = HW.zero_order_dot(rgb)
+    except Exception:
+        return None
+    if dot is None:
+        return None
+    cx, cy = float(cp["cx_px"]), float(cp["cy_px"])
+    rr = np.radians(float(cp.get("laser_roll_deg", 0.0) or 0.0))
+    return float(cx + (dot[0] - cx) * np.cos(rr) + (dot[1] - cy) * np.sin(rr))
+
+
+def undistort_uv(uv, cp, iters=6):
+    """검출 화소에서 **렌즈 왜곡을 되돌린다** (Brown–Conrady 역보정).
+
+    왜 빼먹으면 안 되는가
+    --------------------
+    삼각측량은 Z = f·b/(f·tanα − Δu) 로 화소 오차 Δu 를 그대로 깊이로
+    옮긴다. 시제품 렌즈의 실측 계수(k1 0.0144, k2 0.1249)는 화면 구석에서
+    약 3px 을 밀어 놓고, 1.36m 에서 그것이 깊이 15mm 에 해당한다. 평활도
+    허용치가 3mm 이므로 빼먹을 값이 아니다.
+
+    얼마나 듣는가 — 실촬영 capture_001 에서 잰 값
+    -------------------------------------------
+    벽 전체 평면 맞춤 잔차 RMS 가 38.4mm → 32.3mm 로 줄었다. **남은 30mm
+    는 왜곡이 아니다** — 되돌린 뒤에도 선별 깊이가 가운데 1.385m 에서
+    오른쪽 끝 1.258m 로 완만히 떨어진다. 필요한 보정을 발사각으로 환산하면
+    바깥 선에서 −9.5mrad 이고, 이는 등탄젠트 모델과 실제 DOE 의 차이다
+    (README 「알려진 문제」). 그 몫은 선별 실측 법선(lines.*.normal)으로만
+    없앨 수 있다. 즉 이 보정은 **필요하지만 충분하지 않다.**
+
+    되돌리기는 닫힌 식이 없어 반복으로 푼다. 6회면 이 계수대에서 1e-9 px
+    아래로 수렴한다.
+    """
+    a = np.asarray(uv, float)
+    k = list(cp.get("dist_coeffs") or [])
+    if len(k) < 4 or not any(abs(float(x)) > 1e-12 for x in k):
+        return a
+    k1, k2, p1, p2 = (float(k[0]), float(k[1]), float(k[2]), float(k[3]))
+    k3 = float(k[4]) if len(k) > 4 else 0.0
+    f, cx, cy = float(cp["f_px"]), float(cp["cx_px"]), float(cp["cy_px"])
+    xd = (a[..., 0] - cx) / f
+    yd = (a[..., 1] - cy) / f
+    x, y = xd.copy(), yd.copy()
+    for _ in range(int(iters)):
+        r2 = x * x + y * y
+        rad = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+        dx = 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+        dy = p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+        x = (xd - dx) / rad
+        y = (yd - dy) / rad
+    return np.stack([x * f + cx, y * f + cy], axis=-1)
+
+
 def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
     """
     이미지에서 격자를 직접 읽어 **측정거리와 화소 규약** 을 추정한다.
@@ -464,11 +549,37 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
     tol = 0.25 * float(np.min(np.diff(np.sort(base))))
     # 1/Z 를 균등히 훑는다. 시차가 1/Z 에 비례하므로 이쪽이 고른 격자다.
     inv = np.linspace(1.0 / z_hi, 1.0 / z_lo, 1200)
+    # [2026-09-21 실데이터] 빗살은 주기적이라 위 구간 전체를 훑으면 엉뚱한
+    # 칸에서 만점이 나온다. 0차 도트가 보이면 그 거리 둘레 **반 주기** 로
+    # 좁힌다 — 칸은 도트가 고르고, 값은 빗살이 다듬는다. 도트가 없으면
+    # 예전처럼 전 구간을 훑되, 그 사실을 결과에 남긴다.
+    u_dot = _zero_order_dot_u(rgb, cp)
+    period = float(np.min(np.diff(np.sort(base)))) / max(fb, 1e-9)
+    tilt_px = f * np.tan(np.radians(float(cp.get("laser_tilt_deg", 0.0) or 0.0)))
+    basis = "격자 빗살 (0차 도트 없음 — 거리 앨리어스 주의)"
+    z_dot = None
 
     best = None
     for flipped in (False, True):
         u = np.sort(2 * cx - u_img if flipped else u_img)
-        for iz in inv:
+        inv_c = inv
+        if u_dot is not None:
+            # 도트도 같은 규약으로 옮겨 본다. 시차가 음수면 그 규약은 도트와
+            # 모순이므로 통째로 버린다 — 규약을 도트가 정한다.
+            par = cx + tilt_px - (2 * cx - u_dot if flipped else u_dot)
+            if par <= 1e-6:
+                continue
+            z_dot_c = float(fb / par)
+            if not (z_lo <= z_dot_c <= z_hi):
+                continue
+            lo = max(1.0 / z_hi, 1.0 / z_dot_c - 0.5 * period)
+            hi = min(1.0 / z_lo, 1.0 / z_dot_c + 0.5 * period)
+            if hi <= lo:
+                continue
+            inv_c = np.linspace(lo, hi, 1200)
+            basis = "0차 도트로 칸·규약 고정 + 격자 빗살로 다듬음"
+            z_dot = z_dot_c
+        for iz in inv_c:
             pred = base - fb * iz
             d = np.abs(u[:, None] - pred[None, :])
             near = d.min(axis=1)
@@ -494,10 +605,13 @@ def estimate_grid_pose(rgb, cp, line_angles, z_lo=0.4, z_hi=8.0):
                 best = (key, cand)
     if best is None:
         return {"ok": False, "reason": "격자에서 거리를 풀지 못함",
-                "n_lines_read": int(len(u_img))}
+                "n_lines_read": int(len(u_img)), "basis": basis,
+                "z_dot_m": (round(float(z_dot), 4) if z_dot else None)}
     out = best[1]
     out["ok"] = True
     out["n_lines_read"] = int(len(u_img))
+    out["basis"] = basis
+    out["z_dot_m"] = (round(float(z_dot), 4) if z_dot else None)
     return out
 
 
@@ -888,6 +1002,9 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
         say(f"  격자에서 복원   거리 {pose['z_est_m']:.3f} m  "
             f"(선 {pose['n_matched']}개, 편차 {pose['resid_m']*1000:.0f}mm)"
             + ("   화소 180° 뒤집힘" if flipped else ""))
+        say(f"    거리 근거     {pose.get('basis', '-')}"
+            + (f"  (도트 {pose['z_dot_m']:.3f} m)"
+               if pose.get("z_dot_m") else ""))
         # 깊이 구간은 배율이 아니라 이웃 선 간격이 정한다 — 배경 뒤로는
         # 조금만, 부재가 서 있는 앞쪽으로는 갈 수 있는 데까지.
         cp["z_range"] = _depth_band(cp, line_angles, pose["z_est_m"])
@@ -936,6 +1053,15 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
         half = float(qz.get("sigma_floor_px", 0.29)) * np.sqrt(12.0) / 2.0
         detected = DETECT.smooth_along_lines(detected, half, win=int(smooth))
         say(f"    선따라 평활  창 {int(smooth)}점, 보정 한계 ±{half:.2f}px")
+    if cp.get("dist_coeffs"):
+        detected = {lid: undistort_uv(v, cp)
+                    for lid, v in detected.items() if len(v)}
+        k = cp["dist_coeffs"]
+        say(f"    렌즈 왜곡 보정  k1={k[0]:+.4f} k2={k[1]:+.4f} "
+            f"p1={k[2]:+.4f} p2={k[3]:+.4f}  (삼각측량 전 역보정)")
+    else:
+        say("    렌즈 왜곡 보정  없음 — camera.dist_coeffs 가 사양에 없다. "
+            "구석에서 깊이가 휜다(이 렌즈 계수로 1.4m 에서 ~15mm)")
     lines_xyz, lines_uv, tri = PIPE.triangulate_lines(detected, line_angles, cp)
     n3d = sum(len(v) for v in lines_xyz.values())
     if n3d == 0:
@@ -1009,6 +1135,7 @@ def _run_plain(image, params, truth, scene_image, imu, out, out_dir, name,
                              f"(선 {pose['n_matched']}개, "
                              f"편차 {pose['resid_m']*1000:.0f}mm)"
                              if pose.get("ok") else "복원 실패"),
+            "거리 근거": pose.get("basis", "-"),
             "화소 180° 뒤집힘": str(flipped),
             "카메라 사양 출처": p_meta["출처"],
             "중력 기준": g_src,
@@ -1414,7 +1541,34 @@ def _caveats(g_assumed, params, truth, qz, su, depth, backend):
     return c
 
 
+
+
+def _console_utf8():
+    """윈도우 기본 인코딩(cp949)은 ‘—’ 한 글자에 UnicodeEncodeError 로 죽는다.
+
+    콘솔로 바로 찍을 때는 파이썬이 유니코드로 써 주지만, **파일로 리다이렉트**
+    하면(`python hardware.py … > 점검.txt`) 로케일 인코딩이 걸려 그 자리에서
+    멈췔 버린다. 현장에서 점검 기록을 파일로 남기는 것은 당연한 일이므로,
+    이 문서가 쓰는 글자를 감당 못 하는 인코딩이면 UTF-8 로 바꿈다.
+    """
+    probe = "— · → ±°σ"
+    for st in (_sys.stdout, _sys.stderr):
+        try:
+            probe.encode(getattr(st, "encoding", None) or "ascii")
+            continue                      # 그대로 써도 된다
+        except Exception:
+            pass
+        for kw in ({"encoding": "utf-8"}, {"errors": "replace"}):
+            try:
+                st.reconfigure(**kw)
+                probe.encode(getattr(st, "encoding", None) or "utf-8")
+                break
+            except Exception:
+                continue
+
+
 def main():
+    _console_utf8()
     ap = argparse.ArgumentParser(
         description="레이저 그리드 품질검측 — 이미지 한 장 → 엑셀 조서 하나")
     ap.add_argument("--image", required=True, help="레이저 격자 이미지 (필수)")
@@ -1427,7 +1581,9 @@ def main():
                     help="레이저 OFF 장면 사진 (선택, 배경용)")
     ap.add_argument("--out", default=None, help="엑셀 조서 경로")
     ap.add_argument("--profile", default=None,
-                    help="사양 프로파일 (legacy/pdf/improved/diagonal)")
+                    help="사양 프로파일 "
+                         "(unisj_proto/legacy/pdf/improved/diagonal). "
+                         "기본값은 활성 프로파일")
     ap.add_argument("--backend", default="geom", choices=["geom", "sam", "vlm"])
     ap.add_argument("--standoff", type=float, default=None,
                     help="대표 측정거리 [m]")

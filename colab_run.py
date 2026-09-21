@@ -62,8 +62,10 @@ _IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
 def _sh(cmd, **kw):
     """조용히 실행하고 (성공?, 출력) 을 돌려준다."""
-    p = subprocess.run(cmd, shell=isinstance(cmd, str),
-                       capture_output=True, text=True, **kw)
+    # 출력은 UTF-8 로 읽는다. 한국어 로그가 로케일(cp949)로 디코딩되면
+    # 코랩 밖(윈도우)에서 읽기 스레드가 죽어 출력이 통째로 사라진다.
+    p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                       encoding="utf-8", errors="replace", **kw)
     return p.returncode == 0, (p.stdout + p.stderr).strip()
 
 
