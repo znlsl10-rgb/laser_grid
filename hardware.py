@@ -73,11 +73,11 @@ f 가 5% 틀리거나, 기선을 잘못 적었거나, 선 수·발산각이 데�
 camera_params.json — 값마다 '어떻게 얻는가' 가 다르다
 ────────────────────────────────────────────────────────────────────────
     {
-      "camera": {"f_px": 1593.0, "cx_px": 1224.0, "cy_px": 1024.0,
+      "camera": {"f_px": 3367.66, "cx_px": 1195.32, "cy_px": 1068.42,
                  "sensor_W": 2448, "sensor_H": 2048},
-      "baseline_m": 0.150,
-      "grid": {"n_vertical": 21, "n_horizontal": 21, "fov_deg": 60.82},
-      "laser": {"roll_deg": 20.0, "tilt_deg": 0.0, "wavelength_nm": 520}
+      "baseline_m": 0.1573,
+      "grid": {"n_vertical": 20, "n_horizontal": 20, "fov_deg": 43.34},
+      "laser": {"roll_deg": 38.0, "tilt_deg": 3.11, "wavelength_nm": 520}
     }
 
   f_px, cx_px, cy_px   체커보드 캘리브레이션. **추정 금지** —
@@ -283,12 +283,58 @@ def depth_gain(normal, b_vec=(1.0, 0.0, 0.0)):
 
 
 def fan_angles(n, fov_deg, model="equal_angle"):
-    """DOE 가 만드는 n 개 광선의 발사각 [rad]. 바깥 두 선이 ±fov/2."""
+    """DOE 가 만드는 n 개 광선의 발사각 [rad]. 바깥 두 선이 ±fov/2.
+
+    equal_tan 은 유니스제이 시제품 DOE 의 실측 거동이다 — 셀프캘 시트의 적도
+    방위 tan 이 선 번호에 대해 선형(실측 간격 0.04183)이었다(2026-09-11).
+    평면 스크린에 등간격으로 맺히는 설계이며, 이 모델이 없으면 업체가 등각
+    모델에 억지로 맞춘 등가 발산각(45.75°)을 적어 보내야 한다.
+    """
     half = _math.radians(float(fov_deg)) / 2.0
     t = np.linspace(-1.0, 1.0, int(n))
     if model == "equal_sine":
         return np.arcsin(_math.sin(half) * t)
+    if model == "equal_tan":
+        return np.arctan(_math.tan(half) * t)
     return half * t
+
+
+def _erode3(m):
+    """3×3 침식 (numpy 만으로). 선(3~6px)은 몇 번이면 사라지고 도트는 남는다."""
+    e = (m[:-2, :-2] & m[:-2, 1:-1] & m[:-2, 2:] &
+         m[1:-1, :-2] & m[1:-1, 1:-1] & m[1:-1, 2:] &
+         m[2:, :-2] & m[2:, 1:-1] & m[2:, 2:])
+    out = np.zeros_like(m)
+    out[1:-1, 1:-1] = e
+    return out
+
+
+def zero_order_dot(rgb, max_iter=8):
+    """0차 도트(회절되지 않은 중앙 점) — (x, y, 두께px) 또는 None.
+
+    왜 보는가 — 검측은 이 점 위를 지나는 선을 k=0 으로 놓고 거기서부터
+    선 번호를 매긴다. 보이는 선에 순번을 매기면 선 하나가 빠질 때마다
+    바깥 번호가 전부 밀려 깊이가 수백 mm 틀린다(실측: 1.359m 벽 → 0.77m).
+
+    도트는 선보다 굵다는 것으로 가른다. 실측 도트 두께 20px 이상,
+    격자선 3~6px. 침식을 반복해 살아남는 코어를 찾는다.
+    """
+    a = np.asarray(rgb)
+    g = a[:, :, 1] if a.ndim == 3 else a
+    for level in (250, 235, 215):
+        m = g >= level
+        if int(m.sum()) < 12:
+            continue
+        cur, k = m, 0
+        while k < max_iter:
+            nxt = _erode3(cur)
+            if not nxt.any():
+                break
+            cur, k = nxt, k + 1
+        if k >= 4:                      # 3×3 침식 4회 ≈ 두께 9px 이상
+            ys, xs = np.nonzero(cur)
+            return float(xs.mean()), float(ys.mean()), 2 * k + 1
+    return None
 
 
 def _line_runs(mask, min_gap=3):
@@ -689,6 +735,17 @@ def check_geometry(path, params):
     sig, _meta = laser_signal(a)
     H, W = sig.shape
 
+    # ── 0차 도트 (규약 4.0) ──
+    dot = zero_order_dot(a)
+    if dot is None:
+        warn.append(
+            "**0차 도트가 보이지 않는다** — 검측은 이 점 위를 지나는 선을 k=0 "
+            "으로 놓고 선 번호를 매긴다. 도트가 없으면 격자 전체가 다 보일 "
+            "때만 대칭 가정으로 대체할 수 있고, 일부만 보이면 검측이 불가하다. "
+            "도트가 프레임 안에 들어오게 조준할 것 (규약 4.0)")
+    else:
+        info["0차 도트"] = (f"({dot[0]:.0f}, {dot[1]:.0f}) 두께 ~{dot[2]}px")
+
     f = _dig(params, "camera.f_px")
     cx = _dig(params, "camera.cx_px")
     cy = _dig(params, "camera.cy_px")
@@ -764,7 +821,7 @@ def check_geometry(path, params):
 
         # (1) 초점거리 — 선 사이 간격이 정한다. 거리·기선과 무관하다.
         best = None
-        for model in ("equal_angle", "equal_sine"):
+        for model in ("equal_angle", "equal_sine", "equal_tan"):
             al = fan_angles(int(n_v), float(fov), model)
             ff = fit_focal(v, al, f_hint=fpx)
             if ff and (best is None or ff["잔차_px"] < best[1]["잔차_px"]):
@@ -819,7 +876,32 @@ def check_geometry(path, params):
                     f"법선(lines.*.normal)을 직접 재서 넣을 것")
 
             # (2) 거리와 기선 — 둘은 b/Z 로만 식에 들어와 따로 못 가른다.
-            par = cxp - ff["offset_px"]          # = f·b·cos γ / Z
+            #
+            # [2026-09-21] 시차 항은 **0차 도트로 직접 잰다**. 도트는 회절되지
+            # 않은 광축 자체라 굴림·발사각과 무관하게
+            #     u_dot = c_x − f·b/Z      (굴림 γ 로 되돌린 좌표에서 f·b·cosγ/Z)
+            # 에 찍힌다. 선을 사양 발사각에 순서대로 짝지어 오프셋을 얻는
+            # 기존 방식은 바깥 선이 화면 밖으로 나가면 짝이 한두 칸 밀려
+            # 시차가 통째로 틀어졌다(유니스제이 보고: 부분 가시 9/20 에서
+            # 오프셋 앨리어스). 도트는 한 점이라 그 문제가 없다.
+            par = cxp - ff["offset_px"]          # = f·b·cos γ / Z (선 짝짓기 기반)
+            if dot is not None:
+                cyp = (_dig(params, "camera.cy_px") or 0.5 * (H - 1))
+                u_rot = cxp + (dot[0] - cxp) * _math.cos(rr)                     + (dot[1] - cyp) * _math.sin(rr)
+                # 0차 광선이 광축과 나란하지 않으면(수렴각 tilt) 도트가 그만큼
+                # 옆으로 간다: u_dot = c_x − f·b·cosγ/Z + f·tan(tilt).
+                # 수렴각을 빼지 않으면 그 몫이 시차로 잘못 읽혀 거리가 배로 튄다
+                # (유니스제이 04 샘플: tilt 3.11° 를 0 으로 적어 보내 1.36m 가
+                #  2.50m 로 복원됐다).
+                par_dot = cxp + f_meas * _math.tan(_math.radians(tilt)) - u_rot
+                if par_dot > 1e-6:
+                    info["시차 기준"] = ("0차 도트" if tilt else
+                                     "0차 도트 (수렴각 0 가정 — tilt_deg 확인 필요)")
+                    par = par_dot
+                else:
+                    info["시차 기준"] = "선 짝짓기 (도트 시차가 음수)"
+            else:
+                info["시차 기준"] = "선 짝짓기 (도트 없음)"
             if par > 1e-6 and f_meas > 0:
                 bz = par / (f_meas * _math.cos(rr))       # = b/Z
                 info["기선/거리 비 b/Z"] = round(bz, 5)
@@ -831,7 +913,17 @@ def check_geometry(path, params):
                     dz = abs(z_from_b - float(known)) / float(known)
                     info["측정거리 대조"] = (f"복원 {z_from_b:.3f}m / 실측 "
                                        f"{float(known):.3f}m ({dz*100:.1f}%)")
-                    if dz > 0.03:
+                    dot_based = str(info.get("시차 기준", "")).startswith("0차 도트")
+                    if dz > 0.03 and len(v) < int(n_v) and not dot_based:
+                        # 부분 가시면 짝짓기가 밀려 복원 거리가 통째로 틀어진다.
+                        # 사양이 틀렸다고 단정할 수 없으므로 경고로 내린다.
+                        warn.append(
+                            f"복원 거리 {z_from_b:.3f}m 가 실측 {float(known):.3f}m 와 "
+                            f"{dz*100:.0f}% 다르지만, 사양 {int(n_v)}선 중 {len(v)}선만 "
+                            f"보여 짝짓기가 밀렸을 수 있다(오프셋 앨리어스). 사양 오류로 "
+                            f"단정할 수 없다 — 격자가 다 들어오는 거리에서 한 벌 더 "
+                            f"찍거나 선별 평면 법선을 주면 가려낼 수 있다")
+                    elif dz > 0.03:
                         bad.append(
                             f"실측 거리 {float(known):.3f}m 인 촬영인데 사양 "
                             f"값으로 복원하면 {z_from_b:.3f}m 다 "
@@ -846,6 +938,21 @@ def check_geometry(path, params):
                         f"{bz:.4f}). 검증하려면 **거리를 자로 잰 촬영** 을 "
                         f"한 벌 넣고 camera_params.json 에 "
                         f"\"측정거리_m\": 1.50 처럼 적어 줄 것")
+            elif len(v) < int(n_v) and not str(
+                    info.get("시차 기준", "")).startswith("0차 도트"):
+                # [2026-09-21] 선이 일부만 보이면 오프셋을 믿을 수 없다.
+                # fit_focal 은 읽은 선을 사양 발사각에 **순서대로** 짝짓는데,
+                # 바깥 선이 화면 밖으로 나가면 그 짝이 통째로 한두 칸 밀린다.
+                # 밀린 만큼이 시차 항에 그대로 실려 부호까지 뒤집힌다.
+                # 선 간격(=초점거리)은 이 밀림에 영향받지 않으므로 위 (1) 의
+                # 판정은 그대로 유효하다.
+                warn.append(
+                    f"기선·거리는 이 촬영으로 검증할 수 없다 — 사양 {int(n_v)}선 중 "
+                    f"{len(v)}선만 화면에 들어와, 읽은 선과 사양 발사각의 짝이 "
+                    f"한두 칸 밀릴 수 있다(오프셋 앨리어스). 초점거리 판정은 "
+                    f"선 간격으로만 정해지므로 영향받지 않는다. 격자가 다 들어오는 "
+                    f"거리에서 한 벌 더 찍거나, 선별 평면 법선(lines.*.normal)을 "
+                    f"주면 이 한계가 사라진다")
             else:
                 warn.append("시차 항이 0 이하로 나왔다 — 카메라가 조사기의 "
                             "반대편(−x)에 있거나 주점 값이 어긋났을 수 있다")
@@ -1198,7 +1305,7 @@ def colab(paths=None, verbose=True, report="점검결과.json"):
 # =====================================================================
 # 예제 만들기 — "맞는 데이터" 가 어떻게 생겼는지
 # =====================================================================
-def demo(out_dir="예제촬영", roll_deg=20.0, verbose=True):
+def demo(out_dir="예제촬영", roll_deg=38.0, verbose=True):
     """
     규약을 만족하는 촬영 한 벌을 만들어 둔다.
 
@@ -1208,10 +1315,12 @@ def demo(out_dir="예제촬영", roll_deg=20.0, verbose=True):
     보여 주는 용도다.
     """
     from PIL import Image
-    W, H = 1224, 1024
-    f, b = 942.4, 0.150
-    n_v = n_h = 21
-    fov = 45.24
+    # [2026-09-21] 유니스제이 시제품 실측 사양으로 통일. 여기서 만드는 예제는
+    # 사양 파일과 이미지가 정의상 일치하므로, 업체가 자기 촬영을 견줄 기준이 된다.
+    W, H = 2448, 2048
+    f, b = 3367.66, 0.1573
+    n_v = n_h = 20
+    fov = 43.34                                    # 등탄젠트 기준 (tan 간격 0.04183)
     Z = 1.50
     cx, cy = 0.5 * (W - 1), 0.5 * (H - 1)
     rr = _math.radians(float(roll_deg))
@@ -1220,9 +1329,17 @@ def demo(out_dir="예제촬영", roll_deg=20.0, verbose=True):
                          np.arange(H, dtype=np.float32))
     uh, vh = (uu - cx) / f, (vv - cy) / f
     lit = np.zeros((H, W), np.float32)
-    sig_px = 0.9                                   # 선폭 σ [px]
+    # 선폭 σ — 시제품 실측 선폭(1.5~2px)에 맞춘다. 2448px 폭에서 0.9 로 두면
+    # 선이 한 화소에 갇혀 이진으로 찍히고 점검기가 선을 못 읽는다.
+    sig_px = 1.6                                   # 선폭 σ [px]
+    # 발사각은 규약의 부채꼴 모델(바깥 두 선이 ±fov/2) 그대로 깐다. 점검기가
+    # 사양과 대조할 때 쓰는 것도 이 모델이라, 예제가 다른 배치면 반 칸 어긋난
+    # 만큼이 시차로 잘못 읽힌다.
+    #   ※ 유니스제이 시제품 DOE 는 0차 도트 **위를** 한 선이 지나는 배치다
+    #     (선 간격의 tan 이 정수배). 검측은 두 경우를 모두 처리하지만,
+    #     예제는 규약 모델과 일치시켜 둔다.
     for fixed, n_lines in (("alpha", n_v), ("beta", n_h)):
-        for a in fan_angles(n_lines, fov):
+        for a in fan_angles(n_lines, fov, "equal_tan"):
             n = plane_normal(fixed, float(a), 0.0, rr)
             lat = _math.hypot(n[0], n[1])
             if lat < 1e-9:
@@ -1230,6 +1347,12 @@ def demo(out_dir="예제촬영", roll_deg=20.0, verbose=True):
             # 깊이 Z 의 정면 평면 위에서 이 선까지의 화소 거리
             d = (n[0] * uh + n[1] * vh + n[2] + n[0] * b / Z) * f / lat
             lit = np.maximum(lit, np.exp(-0.5 * (d / sig_px) ** 2))
+    # 0차 도트 — 회절되지 않은 중앙 점. V(k=0)·H(k=0) 두 선이 만나는 자리이며,
+    # 풀어 보면 굴림각과 무관하게 (cx − f·b/Z, cy) 다. 규약 4.0 이 요구한다.
+    du, dv = cx - f * b / Z, cy
+    dot_sig = 6.0 * sig_px                          # 실촬영 도트 두께 17~20px 수준
+    lit = np.maximum(lit, np.exp(-0.5 * (((uu - du) ** 2 + (vv - dv) ** 2)
+                                         / dot_sig ** 2)))
     rng = np.random.default_rng(3)
     base = 96.0 + 8.0 * rng.normal(0, 1, (H, W)).astype(np.float32)
     a_on = np.stack([base * 0.92, base + 150.0 * lit, base * 0.88], axis=2)

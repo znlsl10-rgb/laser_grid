@@ -255,9 +255,19 @@ def _backend_geom(rgb_off, table=None, g_hat=None, camera_params=None,
             cls = {"plane_vertical": "wall",
                    "plane_horizontal": "floor"}.get(ev["shape"])
             if (cls is not None and _is_narrow_strip(ev)
-                    and _stands_in_front(pts, gidx, g_hat, occluder_margin_m)):
+                    and _stands_in_front(pts, gidx, g_hat, occluder_margin_m,
+                                         undecided=True)):
                 # 평면으로 맞기는 하지만 벽이라 부를 폭이 아니고, 게다가
                 # 주변보다 앞에 서 있다 → 면이 아니라 부재다.
+                #
+                # [2026-09-21] undecided=True — _stands_in_front 의 규칙대로다
+                # ("형상이 이미 얇은 부재라고 말하고 있으면 모름을 통과로").
+                # 여기는 _is_narrow_strip 이 이미 폭 10cm 미만이라고 판정한
+                # 자리인데 undecided 기본값(탈락)을 쓰고 있었다. 점이 성긴
+                # 촬영에서는 깊이를 견줄 이웃이 없어 "모름"이 나오고, 그러면
+                # 폭 4cm 짜리 동바리 조각이 **벽** 으로 조서에 실린다
+                # (시제품 사양 합성 씬: 29점·폭 4.4cm 조각이 두 번째 벽으로
+                #  잡혀 자 처짐이 3.66mm 로 낮게 나왔다).
                 cls = "shoring"
             if cls is None:
                 # 평면으로 확정되지 않은 덩어리(얇은 원통 등)는 라벨을 붙이지

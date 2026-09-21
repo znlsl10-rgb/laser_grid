@@ -186,7 +186,7 @@ def detect(rgb_image, lines_pixels_raycast, line_angles, camera_params,
         z_lo, z_hi = _z_span(camera_params)
         z_ref = 2.0 / (1.0 / z_lo + 1.0 / z_hi)
         f = float(camera_params.get("f_px", 2318.8))
-        b = float(camera_params.get("b_m", 0.150))
+        b = float(camera_params.get("b_m", 0.1573))
         cx = float(camera_params.get("cx_px", W_img / 2.0))
         cy = float(camera_params.get("cy_px", H_img / 2.0))
         out = {}
@@ -377,7 +377,7 @@ def _geom_u_for_vline(lid, camera_params, H_img, line_angles):
     # 두 번째 항은 카메라가 레이저에서 b 만큼 떨어져 있어 생기는 이동이며,
     # f=2319, b=150mm, Z=1.2m 에서 290px 에 이른다. 추적 밴드는 20~50px
     # 이므로 이 항을 빼면 밴드가 실제 선 근처에 놓이지도 않는다.
-    b = camera_params.get("b_m", 0.150)
+    b = camera_params.get("b_m", 0.1573)
     z_near, z_far = _z_span(camera_params)
     # 장면에 깊이가 여럿이면 밴드 중심을 그 구간의 한가운데에 둔다.
     # 앞에 선 부재(동바리·기둥)는 벽보다 가까워 시차가 더 크므로, 벽
@@ -423,7 +423,7 @@ def _z_span(camera_params):
 def _parallax_span_px(camera_params):
     """깊이 구간 때문에 생기는 예측 위치의 폭 [px]."""
     f = camera_params.get("f_px", 2318.8)
-    b = abs(camera_params.get("b_m", 0.150))
+    b = abs(camera_params.get("b_m", 0.1573))
     lo, hi = _z_span(camera_params)
     return abs(f * b * (1.0 / lo - 1.0 / hi))
 
@@ -453,7 +453,7 @@ def _geom_v_for_hline(lid, camera_params, W_img, line_angles):
         cx = camera_params.get("cx_px",
                                camera_params.get("cx",
                                                  W_default(camera_params) / 2))
-        b = camera_params.get("b_m", 0.150)
+        b = camera_params.get("b_m", 0.1573)
         z_near, z_far = _z_span(camera_params)
         z_mid = 2.0 / (1.0 / z_near + 1.0 / z_far)
         pred = _EQ7.predicted_uv(np.asarray(n, float), z_mid, f, b, cx, cy,

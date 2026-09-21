@@ -51,12 +51,18 @@ def _load(_name):
 _EQ7 = _load("eq7_laser_plane")
 
 # =====================================================================
-# 하드웨어 사양 (PDF 2.2) — 표에 적힌 값
+# 하드웨어 사양 — 제작된 시제품의 실측값
 # =====================================================================
-PIXEL_PITCH_UM = 3.45       # spec  "픽셀 ≥3.45µm" 의 하한 = Sony IMX264
-IMAGE_W = 2448              # spec  2448 × 2048 (5MP)
-IMAGE_H = 2048              # spec
-BASELINE_M = 0.150          # spec  카메라–레이저 광축 150mm
+# [2026-09-21] PDF 사양표 값에서 **유니스제이 시제품 실측값** 으로 통일했다.
+# 출처: 유니스제이 1차 납품 — 캘리브레이션 성적서(2026-09-07) · calibration.json
+#       · laser_planes.json · 04_실촬영_검증.
+# 아래는 use_profile() 전의 초기값이며, 실제로는 활성 프로파일이 덮어쓴다
+# (기본 프로파일도 unisj_proto 다). PDF 원안 값은 "pdf" 프로파일에 남아 있다.
+PIXEL_PITCH_UM = 3.45       # 실측  Sony IMX264 (사양 하한과 동일)
+IMAGE_W = 2448              # 실측  2448 × 2048 (5MP)
+IMAGE_H = 2048              # 실측
+BASELINE_M = 0.1573         # 실측  광학 기선 157.3mm (기구 실측 150mm 와 다름 —
+                            #       레이저 평면 다발 교점 역산, 일치도 중앙값 0.92mm)
 LENS_FNUMBER = 2.0          # spec  "저왜곡 F2.0급"
 FOCUS_DISTANCE_M = 1.2      # spec  "초점 ~1.2m 고정 잠금"
 LASER_WAVELENGTH_NM = 520   # spec  녹색 LD
@@ -244,11 +250,43 @@ SPEC_PROFILES = {
         "sigma_u_px": 0.1, "laser_tilt_deg": 7.40,
         "laser_roll_deg": 45.0,
     },
+    # 실제로 제작된 시제품. 위 네 개가 "설계 검토안" 인 반면 이것은 **실측값** 이다.
+    # 출처: 유니스제이 1차 납품 (2026-09-07 캘리브레이션 성적서, 03_캘리브레이션)
+    #   f_px 3367.66  ChArUco 실측 fx 3373.00 / fy 3362.32 평균, 재투영 RMS 0.538px
+    #                 → 화소 3.45µm 로 환산하면 11.62mm (12mm 렌즈)
+    #   주점          1195.32 / 1068.42 — 센서 중앙(1224/1024)이 아니다. 실측 주점을
+    #                 쓰려고 cx_px·cy_px 키를 둔다 (없는 프로파일은 종전처럼 중앙).
+    #   기선 157.3mm  레이저 평면 다발의 교점을 역산한 **광학** 기선.
+    #                 기구 실측 150mm 와 7.3mm 차이는 광학중심 위치 차다.
+    #   격자          세로 20 + 가로 20, 간격은 등탄젠트(아래 equal_tan 설명 참조)
+    #   굴림 38°      9/7 장착은 0° 였으나 9/10 촬영본은 32~44° 로 재장착됐다.
+    #                 굴림 0 이면 가로선이 깊이를 못 준다(이득 g=∞).
+    #   σ_u 0.3px     유니스제이 measure.py 의 선 추출 잡음 가정
+    "unisj_proto": {
+        "label": "유니스제이 시제품 (실측)",
+        "pixel_pitch_um": 3.45, "image_w": 2448, "image_h": 2048,
+        "sensor_color": "color", "optical_filter_nm": None,
+        "baseline_m": 0.1573, "n_vertical": 20, "n_horizontal": 20,
+        "lens_focal_mm": 3367.66 * 3.45 / 1000.0,
+        "cx_px": 1195.32, "cy_px": 1068.42,
+        "dist_coeffs": [0.014443, 0.124836, 0.002075, -0.004078, 0.0],
+        # 발산각: 실측 간격 tan 0.04183 × (20−1)선 = 전체 tan 폭 0.7948
+        #         → 반각 atan(0.3974) = 21.67° → 전체 43.34°.
+        #         유니스제이 성적서의 45.75° 는 **등각 모델** 에 맞춰 역산한
+        #         등가값이라 등탄젠트에서는 그대로 쓰면 안 된다.
+        "fov_deg": 43.34, "doe_model": "equal_tan",
+        "pitch_tan": 0.04183,   # 실측 선간격(탄젠트) — 참고·검증용
+        "sigma_u_px": 0.3, "laser_tilt_deg": 3.11,
+        "laser_roll_deg": 38.0,
+    },
 }
-# 기본값은 원본 v4 다. 실제 하드웨어 사양이 확정되지 않았고, 이미 뽑아 둔
-# Isaac 렌더가 이 값으로 만들어졌기 때문이다. 사양이 들어오면 여기를 바꾸거나
-# 환경변수 LASER_GRID_PROFILE 로 전환한다.
-ACTIVE_PROFILE = _os.environ.get("LASER_GRID_PROFILE", "legacy")
+# [2026-09-21] 기본값을 unisj_proto 로 바꿨다. 시제품이 실제로 제작돼 실측값이
+# 들어왔으므로, 설계 검토안(legacy·pdf·improved·diagonal)이 아니라 만들어진
+# 장비가 기준이다. 옛 값으로 돌려 보려면 환경변수로 전환한다:
+#     LASER_GRID_PROFILE=legacy python3 run_pipeline.py ...
+# 실촬영 검측은 이 프로파일이 아니라 촬영 폴더의 camera_params.json 을 읽는다
+# (load_capture). 프로파일은 설계 검토·합성 씬의 기준값이다.
+ACTIVE_PROFILE = _os.environ.get("LASER_GRID_PROFILE", "unisj_proto")
 
 
 # =====================================================================
@@ -282,6 +320,9 @@ def projection_mm_at(z_m, fov_deg=None):
 #                 발사각은 사인 등간격이다. 평면 벽에 맺힌 격자는 가장자리로
 #                 갈수록 간격이 벌어진다.
 #   "equal_angle" 각도 등간격. 원본 v4 가 쓰던 근사.
+#   "equal_tan"   탄젠트 등간격. 시제품 DOE 의 실측 거동이다 — 셀프캘 시트의
+#                 적도 방위 tan 이 선 번호에 대해 선형(간격 0.04183)이었다
+#                 (2026-09-11 확인). 평면 스크린에 등간격으로 맺히는 설계다.
 # 두 모델의 바깥 포락선은 같고 안쪽 배치만 다르다. 42.61°·20선에서 위치 차가
 # 최대 0.19° 이고, 깊이로 환산하면 1.2m 에서 32mm 다. 출고 시 실측 α_i 가
 # 이 모델을 대체한다.
@@ -304,7 +345,7 @@ def use_profile(name=None):
     global N_VERTICAL, N_HORIZONTAL, LENS_FOCAL_MM, SIGMA_U_PX, LASER_TILT_DEG
     global LASER_ROLL_DEG
     global SENSOR_COLOR, OPTICAL_FILTER_NM, FOV_DEG, DOE_ANGLE_MODEL
-    global F_PX, CX_PX, CY_PX, SENSOR_W_MM, SENSOR_H_MM, SENSOR_DIAG_MM
+    global F_PX, CX_PX, CY_PX, SENSOR_W_MM, SENSOR_H_MM, SENSOR_DIAG_MM, DIST_COEFFS
 
     name = ACTIVE_PROFILE if name is None else name
     if name not in SPEC_PROFILES:
@@ -326,8 +367,11 @@ def use_profile(name=None):
     DOE_ANGLE_MODEL = p["doe_model"]
 
     F_PX = focal_px()
-    CX_PX = IMAGE_W / 2.0              # assumed 센서 정중앙. 캘리브레이션 필요
-    CY_PX = IMAGE_H / 2.0              # assumed 동일
+    # 주점: 프로파일에 실측값이 있으면 그것을 쓴다. 없으면 종전대로 센서 중앙
+    # 가정이다 (시제품 실측은 중앙에서 29px / 44px 벗어나 있었다).
+    CX_PX = float(p.get("cx_px", IMAGE_W / 2.0))
+    CY_PX = float(p.get("cy_px", IMAGE_H / 2.0))
+    DIST_COEFFS = list(p.get("dist_coeffs", []))
     # 센서 물리 크기 — Isaac Sim 카메라의 aperture 에 그대로 들어간다.
     SENSOR_W_MM = IMAGE_W * PIXEL_PITCH_UM / 1000.0
     SENSOR_H_MM = IMAGE_H * PIXEL_PITCH_UM / 1000.0
@@ -337,6 +381,8 @@ def use_profile(name=None):
     CAMERA_PARAMS.update({"f_px": round(F_PX, 1), "b_m": BASELINE_M,
                           "cx_px": CX_PX, "cy_px": CY_PX,
                           "resolution": [IMAGE_W, IMAGE_H]})
+    if DIST_COEFFS:
+        CAMERA_PARAMS["dist_coeffs"] = DIST_COEFFS
     GRID_PARAMS.clear()
     GRID_PARAMS.update({"n_vertical": N_VERTICAL, "n_horizontal": N_HORIZONTAL,
                         "fov_deg": FOV_DEG, "laser_tilt_deg": LASER_TILT_DEG,
@@ -357,6 +403,8 @@ def _fan_angles(n, fov_deg, model=None):
         return np.arcsin(np.sin(half) * t)
     if model == "equal_angle":
         return half * t
+    if model == "equal_tan":
+        return np.arctan(np.tan(half) * t)
     raise ValueError(f"알 수 없는 DOE 모델: {model}")
 
 
@@ -415,6 +463,23 @@ _PROV_COMMON = {
     "b_a":    ("assumed", "미구현. 가속도계 bias 보정 필요"),
 }
 _PROV_BY_PROFILE = {
+    # 제작된 시제품 — 설계 가정이 아니라 실측이라 등급이 대부분 measured 다.
+    "unisj_proto": {
+        "f_px":    ("measured", "ChArUco 실측 fx 3373.00 / fy 3362.32 평균, "
+                                "재투영 RMS 0.538px (2026-09-07 성적서)"),
+        "cx_px":   ("measured", "실측 주점 1195.32px — 센서 중앙(1224)이 아니다"),
+        "cy_px":   ("measured", "실측 주점 1068.42px — 센서 중앙(1024)이 아니다"),
+        "b_m":     ("measured", "광학 기선 157.3mm — 레이저 평면 다발 교점 역산, "
+                                "일치도 중앙값 0.92mm. 기구 실측 150mm 와 다름"),
+        "fov_deg": ("measured", "등탄젠트 tan 간격 0.04183 × 19선 → 43.34°. "
+                                "성적서의 45.75° 는 등각 모델 등가값"),
+        "n_lines": ("measured", "20+20 (400 교점)"),
+        "sensor":  ("spec",     "RGB 컬러 Daheng MER2-503-36U3C / Sony IMX264"),
+        "tilt":    ("measured", "0차 도트 광선 방위 3.11°"),
+        "alpha_i": ("measured", "셀프캘 시트 — 선별 적도 방위각 실측"),
+        "sigma_u": ("assumed",  "0.3px — 유니스제이 measure.py 가정. "
+                                "선검출 반복성 측정 필요"),
+    },
     "legacy": {
         "f_px":    ("assumed", "원본 v4 튜닝값 1593px. 5.50mm 렌즈에 해당"),
         "b_m":     ("spec",    "PDF 2.2 광축 150mm. 조립 후 실측 필요"),

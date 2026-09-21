@@ -448,7 +448,7 @@ def region_uncertainty(points_3d, camera_params, normal=None,
     """
     pts = np.asarray(points_3d, dtype=float)
     f = float(camera_params.get("f_px", 2318.8))
-    b = float(camera_params.get("b_m", 0.150))
+    b = float(camera_params.get("b_m", 0.1573))
     Z = pts[:, 2]
     z_mean = float(np.mean(Z))
     sigma_z_mm = float(sigma_u_px * z_mean ** 2 / (f * b) * 1000.0)

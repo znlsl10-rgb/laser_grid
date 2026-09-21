@@ -256,7 +256,8 @@ if __name__ == "__main__":
                             "eq1_triangulation.py"))
     _EQ1 = _ilu.module_from_spec(_s); _s.loader.exec_module(_EQ1)
 
-    f, b, cx, cy = 1593.0, 0.150, 1224.0, 1024.0
+    # 시제품 실측 사양 (유니스제이 1차 납품 캘리브레이션, 2026-09-21 반영)
+    f, b, cx, cy = 3367.66, 0.1573, 1195.32, 1068.42
     rng = np.random.default_rng(11)
 
     # 1) V선에서 eq1 과 완전히 일치하는가
